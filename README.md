@@ -113,6 +113,33 @@ python3 pegaprox_multi_cluster.py
 ```
 
 
+## Updating to v0.6.1
+
+**Option 1: Update Script (Recommended)**
+```bash
+./update.sh
+```
+
+**Option 2: Manual**
+```bash
+curl -O https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/pegaprox_multi_cluster.py
+curl -o web/index.html https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/web/index.html
+curl -o https://raw.githubusercontent.com/PegaProx/project-pegaprox/main/requirements.txt
+
+# Install dependencies (choose one):
+pip3 install -r requirements.txt                # System Python
+./venv/bin/python -m pip install -r requirements.txt      # Virtual environment
+Can also work with: ./venv/bin/pip install -r requirements.txt 
+
+sudo systemctl restart pegaprox
+```
+
+### What's New in v0.6.1
+- Fixed Force Stop for LXC containers
+- Fixed pagination error in pre-compiled builds ([#4](https://github.com/PegaProx/project-pegaprox/issues/4))
+- Added `update.sh` for easy updates
+- Added `build.sh` for JSX pre-compilation (devs only)
+
 ## 🔧 Configuration
 
 After starting PegaProx, open your browser and navigate to:
