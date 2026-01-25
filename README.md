@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://pegaprox.com/logo.png" alt="PegaProx Logo" width="200"/>
+  <img src="https://pegaprox.com/pictures/pegaprox-logo.png" alt="PegaProx Logo" width="200"/>
 </p>
 
 <h1 align="center">PegaProx</h1>
