@@ -1,0 +1,17 @@
+{
+    "version": "0.6.0",
+    "build": "2026.01.25",
+    "release_date": "2026-01-25",
+    "min_python": "3.8",
+    "download_url": "https://github.com/PegaProx/project-pegaprox/releases/latest",
+    "changelog": [
+        "Complete SQLite Migration - cluster_alerts, esxi_storages, storage_clusters, affinity_rules",
+        "Fixed VM ACL delete not working",
+        "Fixed Taskbar not updating on cluster switch",
+        "Fixed Alerts create/delete functionality",
+        "Fixed Affinity Rules VM selection display",
+        "Automatic JSON to SQLite migration on startup",
+        "Improved stale task detection logic"
+    ],
+    "breaking_changes": []
+}
