@@ -10,7 +10,10 @@
 #   ./update.sh              # Normal update
 #   ./update.sh --force      # Force update (skip version check)
 #
+# Note: Safe to run as root - automatically preserves original file ownership
+#
 # MK: Created 25.01.2026 - the web updater was buggy, this is more reliable
+# MK: Updated it on 26.01
 # ============================================================================
 
 set -e
@@ -29,15 +32,32 @@ GITHUB_RAW="https://raw.githubusercontent.com/PegaProx/project-pegaprox/main"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# MK: Figure out who owns this installation
+# We check config/ because that folder never gets overwritten by updates
+# Learned this the hard way when everything became root:root...
+ORIGINAL_OWNER=""
+if [ -d "config" ]; then
+    ORIGINAL_OWNER=$(stat -c '%U:%G' config 2>/dev/null || stat -f '%Su:%Sg' config 2>/dev/null)
+elif [ -f "cert.pem" ]; then
+    ORIGINAL_OWNER=$(stat -c '%U:%G' cert.pem 2>/dev/null || stat -f '%Su:%Sg' cert.pem 2>/dev/null)
+elif [ -d "ssl" ]; then
+    ORIGINAL_OWNER=$(stat -c '%U:%G' ssl 2>/dev/null || stat -f '%Su:%Sg' ssl 2>/dev/null)
+fi
+
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║               PegaProx Update Script                       ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Check if running as root (needed for service restart)
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${YELLOW}⚠ Not running as root - service restart may fail${NC}"
-    echo "  Run with: sudo ./update.sh"
+# Check if running as root
+if [ "$EUID" -eq 0 ]; then
+    echo -e "${BLUE}Running as root${NC}"
+    if [ -n "$ORIGINAL_OWNER" ]; then
+        echo -e "  Will restore ownership to: ${GREEN}$ORIGINAL_OWNER${NC}"
+    fi
+    echo ""
+else
+    echo -e "${YELLOW}Tip: sudo ./update.sh for auto service restart${NC}"
     echo ""
 fi
 
@@ -92,6 +112,7 @@ mkdir -p "$BACKUP_DIR"
 # Backup important files (not config - that stays)
 [ -f "pegaprox_multi_cluster.py" ] && cp pegaprox_multi_cluster.py "$BACKUP_DIR/"
 [ -f "web/index.html" ] && mkdir -p "$BACKUP_DIR/web" && cp web/index.html "$BACKUP_DIR/web/"
+[ -f "web/index.html.original" ] && cp web/index.html.original "$BACKUP_DIR/web/"
 [ -f "version.json" ] && cp version.json "$BACKUP_DIR/"
 [ -f "requirements.txt" ] && cp requirements.txt "$BACKUP_DIR/"
 
@@ -131,36 +152,49 @@ download_file "web/Dev/build.sh"
 download_file "web/Dev/_Normal_Users_No_Touchies_Devs_always_welcome"
 
 # Make scripts executable
-chmod +x deploy.sh build.sh update.sh 2>/dev/null || true
+chmod +x deploy.sh update.sh 2>/dev/null || true
+chmod +x web/Dev/build.sh 2>/dev/null || true
+
+# Fix ownership if running as root
+# otherwise the service user can't read the files and everything breaks
+if [ "$EUID" -eq 0 ] && [ -n "$ORIGINAL_OWNER" ] && [ "$ORIGINAL_OWNER" != "root:root" ]; then
+    echo -n "Fixing file ownership ($ORIGINAL_OWNER)... "
+    chown "$ORIGINAL_OWNER" pegaprox_multi_cluster.py version.json requirements.txt 2>/dev/null
+    chown "$ORIGINAL_OWNER" deploy.sh update.sh 2>/dev/null
+    chown "$ORIGINAL_OWNER" web/index.html web/index.html.original 2>/dev/null
+    chown -R "$ORIGINAL_OWNER" web/Dev/ 2>/dev/null
+    chown -R "$ORIGINAL_OWNER" backups/ 2>/dev/null
+    echo -e "${GREEN}OK${NC}"
+fi
 
 # Install/update Python packages
 echo ""
 echo -n "Installing Python packages... "
 
-# Try different pip methods - cover all possible setups
+# Try different pip methods - everyone has a different setup lol
 PIP_SUCCESS=false
 
-# Method 1: Virtual environment with python -m pip (recommended)
+# venv with python -m pip (the "proper" way)
 if [ -f "venv/bin/python" ] && [ "$PIP_SUCCESS" = false ]; then
     ./venv/bin/python -m pip install -q -r requirements.txt 2>/dev/null && PIP_SUCCESS=true
 fi
 
-# Method 2: Virtual environment with direct pip
+# venv with direct pip
 if [ -f "venv/bin/pip" ] && [ "$PIP_SUCCESS" = false ]; then
     ./venv/bin/pip install -q -r requirements.txt 2>/dev/null && PIP_SUCCESS=true
 fi
 
-# Method 3: System pip3 (as root)
+# system pip as root
 if [ "$EUID" -eq 0 ] && command -v pip3 &> /dev/null && [ "$PIP_SUCCESS" = false ]; then
     pip3 install -q -r requirements.txt 2>/dev/null && PIP_SUCCESS=true
 fi
 
-# Method 4: System pip3 with --user (non-root)
+# system pip with --user (non-root)
 if command -v pip3 &> /dev/null && [ "$PIP_SUCCESS" = false ]; then
     pip3 install -q --user -r requirements.txt 2>/dev/null && PIP_SUCCESS=true
 fi
 
-# Method 5: python3 -m pip fallback
+# last resort: python3 -m pip
 if command -v python3 &> /dev/null && [ "$PIP_SUCCESS" = false ]; then
     python3 -m pip install -q --user -r requirements.txt 2>/dev/null && PIP_SUCCESS=true
 fi
@@ -168,7 +202,7 @@ fi
 if [ "$PIP_SUCCESS" = true ]; then
     echo -e "${GREEN}OK${NC}"
 else
-    echo -e "${YELLOW}Warning - install manually: pip install -r requirements.txt${NC}"
+    echo -e "${YELLOW}Couldn't install - run: pip install -r requirements.txt${NC}"
 fi
 
 # Restart service
