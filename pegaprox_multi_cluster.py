@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 PegaProx Server - Cluster Management Backend for Proxmox VE
-Version: 0.6.3 Beta
+Version: 0.6.4 Beta
 
 Copyright (C) 2025-2026 PegaProx Team
 
@@ -60,6 +60,10 @@ TODO: CODE SPLITTING before v1.0!! 30k lines in one file is insane - NS
 DONE: general API rate limiting - LW jan 2026 (env: PEGAPROX_API_RATE_LIMIT)
 DONE: disk bus type editing - MK jan 2026 (finally!)
 DONE: EFI/TPM management in UI - LW jan 2026
+DONE: SSH rate limiting for large clusters - NS jan 2026 (env: PEGAPROX_SSH_MAX_CONCURRENT, default: 25)
+      -> Two-tier design: HA operations have PRIORITY (no limit), normal ops are rate-limited
+      -> Prevents connection storms during rolling updates across multiple 15+ node clusters
+      -> HA fencing/heartbeat can always execute immediately
 
 ═══════════════════════════════════════════════════════════════════════════════
 """
@@ -267,8 +271,8 @@ app = Flask(__name__)
 # =============================================================================
 # VERSION INFO
 # =============================================================================
-PEGAPROX_VERSION = "Beta 0.6.3"
-PEGAPROX_BUILD = "2026.01.25"  # Year.Month.Day of release
+PEGAPROX_VERSION = "Beta 0.6.4"
+PEGAPROX_BUILD = "2026.02.01"  # Year.Month.Day of release
 
 # ============================================
 # CORS Configuration (Security)
@@ -685,6 +689,7 @@ class PegaProxDB:
                 last_login TEXT,
                 password_expiry TEXT,
                 totp_secret_encrypted TEXT,
+                totp_pending_secret_encrypted TEXT,
                 totp_enabled INTEGER DEFAULT 0,
                 force_password_change INTEGER DEFAULT 0,
                 enabled INTEGER DEFAULT 1,
@@ -1029,6 +1034,28 @@ class PegaProxDB:
             )
         ''')
         
+        # MK: Pool Permissions - Jan 2026
+        # Store permissions for Proxmox resource pools
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pool_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id TEXT NOT NULL,
+                pool_id TEXT NOT NULL,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                permissions TEXT DEFAULT '[]',
+                created_at TEXT,
+                updated_at TEXT,
+                UNIQUE(cluster_id, pool_id, subject_type, subject_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_pool_perms_cluster ON pool_permissions(cluster_id)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_pool_perms_pool ON pool_permissions(cluster_id, pool_id)
+        ''')
+        
         # Schema migrations for existing databases
         # Add password_salt column if it doesn't exist (for databases created before this fix)
         try:
@@ -1081,6 +1108,15 @@ class PegaProxDB:
                     logging.info("Added enabled column to users table")
                 except Exception as e:
                     logging.error(f"Failed to add enabled column: {e}")
+            
+            # MK: Add totp_pending_secret_encrypted column for 2FA setup
+            if 'totp_pending_secret_encrypted' not in columns:
+                logging.info("Adding totp_pending_secret_encrypted column to users table...")
+                try:
+                    cursor.execute("ALTER TABLE users ADD COLUMN totp_pending_secret_encrypted TEXT DEFAULT ''")
+                    logging.info("Added totp_pending_secret_encrypted column to users table")
+                except Exception as e:
+                    logging.error(f"Failed to add totp_pending_secret_encrypted column: {e}")
                     
         except Exception as e:
             logging.error(f"Error checking users schema: {e}")
@@ -2251,6 +2287,7 @@ class PegaProxDB:
                 'last_login': row_dict.get('last_login'),
                 'password_expiry': row_dict.get('password_expiry'),
                 'totp_secret': self._decrypt(row_dict.get('totp_secret_encrypted') or ''),
+                'totp_pending_secret': self._decrypt(row_dict.get('totp_pending_secret_encrypted') or ''),  # MK: Load pending 2FA secret
                 'totp_enabled': bool(row_dict.get('totp_enabled', 0)),
                 'force_password_change': bool(row_dict.get('force_password_change', 0)),
                 'enabled': bool(row_dict.get('enabled', 1)),
@@ -2288,6 +2325,7 @@ class PegaProxDB:
             'last_login': row_dict.get('last_login'),
             'password_expiry': row_dict.get('password_expiry'),
             'totp_secret': self._decrypt(row_dict.get('totp_secret_encrypted') or ''),
+            'totp_pending_secret': self._decrypt(row_dict.get('totp_pending_secret_encrypted') or ''),  # MK: Load pending 2FA secret
             'totp_enabled': bool(row_dict.get('totp_enabled', 0)),
             'force_password_change': bool(row_dict.get('force_password_change', 0)),
             'enabled': bool(row_dict.get('enabled', 1)),
@@ -2305,11 +2343,11 @@ class PegaProxDB:
             INSERT OR REPLACE INTO users
             (username, password_salt, password_hash, role, permissions, tenant, 
              created_at, last_login, password_expiry, 
-             totp_secret_encrypted, totp_enabled, force_password_change,
+             totp_secret_encrypted, totp_pending_secret_encrypted, totp_enabled, force_password_change,
              enabled, theme, language, ui_layout)
             VALUES (?, ?, ?, ?, ?, ?, 
                     COALESCE((SELECT created_at FROM users WHERE username = ?), ?), 
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             username,
             data.get('password_salt', ''),
@@ -2321,6 +2359,7 @@ class PegaProxDB:
             data.get('last_login'),
             data.get('password_expiry'),
             self._encrypt(data.get('totp_secret', '')),
+            self._encrypt(data.get('totp_pending_secret', '')),  # MK: Save pending 2FA secret
             1 if data.get('totp_enabled', False) else 0,
             1 if data.get('force_password_change', False) else 0,
             1 if data.get('enabled', True) else 0,
@@ -2675,6 +2714,108 @@ class PegaProxDB:
         except Exception as e:
             logging.error(f"Failed to delete VM ACL: {e}")
             return False
+    
+    # ========================================
+    # POOL PERMISSIONS - MK Jan 2026
+    # ========================================
+    
+    def get_pool_permissions(self, cluster_id: str, pool_id: str = None) -> List[Dict]:
+        """Get pool permissions, optionally filtered by pool_id"""
+        cursor = self.conn.cursor()
+        if pool_id:
+            cursor.execute('''
+                SELECT * FROM pool_permissions 
+                WHERE cluster_id = ? AND pool_id = ?
+            ''', (cluster_id, pool_id))
+        else:
+            cursor.execute('''
+                SELECT * FROM pool_permissions WHERE cluster_id = ?
+            ''', (cluster_id,))
+        
+        rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            result.append({
+                'id': row[0],
+                'cluster_id': row[1],
+                'pool_id': row[2],
+                'subject_type': row[3],  # 'user' or 'group'
+                'subject_id': row[4],    # username or group name
+                'permissions': json.loads(row[5]) if row[5] else [],
+                'created_at': row[6],
+                'updated_at': row[7]
+            })
+        return result
+    
+    def save_pool_permission(self, cluster_id: str, pool_id: str, subject_type: str, 
+                            subject_id: str, permissions: List[str]) -> bool:
+        """Save or update pool permission"""
+        try:
+            cursor = self.conn.cursor()
+            now = datetime.now().isoformat()
+            cursor.execute('''
+                INSERT INTO pool_permissions (cluster_id, pool_id, subject_type, subject_id, permissions, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cluster_id, pool_id, subject_type, subject_id) 
+                DO UPDATE SET permissions = ?, updated_at = ?
+            ''', (cluster_id, pool_id, subject_type, subject_id, json.dumps(permissions), now, now,
+                  json.dumps(permissions), now))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Failed to save pool permission: {e}")
+            return False
+    
+    def delete_pool_permission(self, cluster_id: str, pool_id: str, subject_type: str, subject_id: str) -> bool:
+        """Delete a pool permission"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                DELETE FROM pool_permissions 
+                WHERE cluster_id = ? AND pool_id = ? AND subject_type = ? AND subject_id = ?
+            ''', (cluster_id, pool_id, subject_type, subject_id))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logging.error(f"Failed to delete pool permission: {e}")
+            return False
+    
+    def get_user_pool_permissions(self, cluster_id: str, username: str, groups: List[str] = None) -> Dict[str, List[str]]:
+        """Get all pool permissions for a user (including via group membership)
+        Returns: {pool_id: [permissions]}
+        """
+        cursor = self.conn.cursor()
+        
+        # Get direct user permissions
+        cursor.execute('''
+            SELECT pool_id, permissions FROM pool_permissions 
+            WHERE cluster_id = ? AND subject_type = 'user' AND subject_id = ?
+        ''', (cluster_id, username))
+        
+        result = {}
+        for row in cursor.fetchall():
+            pool_id = row[0]
+            perms = json.loads(row[1]) if row[1] else []
+            result[pool_id] = perms
+        
+        # Get group permissions
+        if groups:
+            for group in groups:
+                cursor.execute('''
+                    SELECT pool_id, permissions FROM pool_permissions 
+                    WHERE cluster_id = ? AND subject_type = 'group' AND subject_id = ?
+                ''', (cluster_id, group))
+                
+                for row in cursor.fetchall():
+                    pool_id = row[0]
+                    perms = json.loads(row[1]) if row[1] else []
+                    if pool_id in result:
+                        # Merge permissions (union)
+                        result[pool_id] = list(set(result[pool_id] + perms))
+                    else:
+                        result[pool_id] = perms
+        
+        return result
     
     # ========================================
     # KEY ROTATION (HIPAA/ISO Compliance)
@@ -3103,6 +3244,35 @@ Path(SSL_DIR).mkdir(exist_ok=True)
 
 # Global cluster managers
 cluster_managers = {}  # cluster_id -> PegaProxManager
+
+# Global SSH connection management - NS Jan 2026
+# 
+# Design: Two-tier system with HA priority
+# - HA operations (fencing, heartbeat): NO LIMIT - these are critical and short
+# - Normal operations (updates, SMBIOS deploy): Limited by semaphore
+#
+# Default 25 allows comfortable handling of 2-3 clusters with 15+ nodes each
+# doing simultaneous rolling updates. Increase for larger environments.
+#
+SSH_MAX_CONCURRENT = int(os.environ.get('PEGAPROX_SSH_MAX_CONCURRENT', 25))
+_ssh_semaphore = threading.BoundedSemaphore(SSH_MAX_CONCURRENT)
+_ssh_active_connections = {'normal': 0, 'ha': 0}
+_ssh_connection_lock = threading.Lock()
+
+def get_ssh_connection_stats():
+    """Get current SSH connection statistics"""
+    with _ssh_connection_lock:
+        return {
+            'max_concurrent': SSH_MAX_CONCURRENT,
+            'active_normal': _ssh_active_connections['normal'],
+            'active_ha': _ssh_active_connections['ha'],
+            'total_active': _ssh_active_connections['normal'] + _ssh_active_connections['ha']
+        }
+
+def _ssh_track_connection(conn_type: str, delta: int):
+    """Track SSH connection count"""
+    with _ssh_connection_lock:
+        _ssh_active_connections[conn_type] = max(0, _ssh_active_connections[conn_type] + delta)
 
 # Global sessions store
 # MK: this is in-memory, will be lost on restart
@@ -3648,6 +3818,155 @@ def save_vm_acls(acls: dict):
 
 _vm_acls_cache = None
 
+# MK: Pool membership cache - Jan 2026
+# Structure: {cluster_id: {'data': {vmid: pool_id, ...}, 'timestamp': time, 'refreshing': bool}}
+# TTL: 300 seconds (5 min) - pools don't change often
+# Stale TTL: 30 seconds - return stale data while refreshing in background
+_pool_membership_cache = {}
+POOL_CACHE_TTL = 300  # 5 minutes - pools rarely change
+POOL_CACHE_STALE_TTL = 30  # Return stale data for 30s while refreshing
+_pool_cache_lock = threading.Lock()
+
+def _refresh_pool_cache_async(cluster_id: str):
+    """Background refresh of pool cache - doesn't block requests"""
+    global _pool_membership_cache
+    
+    try:
+        if cluster_id not in cluster_managers:
+            return
+        
+        mgr = cluster_managers[cluster_id]
+        pools = mgr.get_pools()
+        
+        membership = {}
+        for pool in pools:
+            pool_id = pool.get('poolid')
+            if not pool_id:
+                continue
+            
+            try:
+                pool_data = mgr.get_pool_members(pool_id)
+                members = pool_data.get('members', [])
+                
+                for member in members:
+                    vmid = member.get('vmid')
+                    mtype = member.get('type')
+                    if vmid and mtype in ('qemu', 'lxc'):
+                        membership[f"{vmid}:{mtype}"] = pool_id
+            except Exception as e:
+                logging.warning(f"[POOL-CACHE] Error getting members for pool {pool_id}: {e}")
+                continue
+        
+        with _pool_cache_lock:
+            _pool_membership_cache[cluster_id] = {
+                'data': membership,
+                'timestamp': time.time(),
+                'refreshing': False
+            }
+        
+        logging.info(f"[POOL-CACHE] Refreshed cache for cluster {cluster_id}: {len(membership)} VMs in pools")
+        
+    except Exception as e:
+        logging.error(f"[POOL-CACHE] Error refreshing cache for {cluster_id}: {e}")
+        with _pool_cache_lock:
+            if cluster_id in _pool_membership_cache:
+                _pool_membership_cache[cluster_id]['refreshing'] = False
+
+def get_pool_membership_cache(cluster_id: str) -> dict:
+    """Get cached pool memberships for a cluster
+    
+    Returns {vmid:type: pool_id, ...} mapping
+    Uses stale-while-revalidate pattern for better performance
+    """
+    global _pool_membership_cache
+    
+    now = time.time()
+    
+    with _pool_cache_lock:
+        cache_entry = _pool_membership_cache.get(cluster_id)
+        
+        # No cache at all - need synchronous refresh
+        if not cache_entry:
+            _pool_membership_cache[cluster_id] = {'data': {}, 'timestamp': 0, 'refreshing': True}
+    
+    if cache_entry:
+        age = now - cache_entry.get('timestamp', 0)
+        
+        # Cache is fresh - return immediately
+        if age < POOL_CACHE_TTL:
+            return cache_entry.get('data', {})
+        
+        # Cache is stale but usable - return it and refresh in background
+        if age < POOL_CACHE_TTL + POOL_CACHE_STALE_TTL:
+            if not cache_entry.get('refreshing'):
+                with _pool_cache_lock:
+                    _pool_membership_cache[cluster_id]['refreshing'] = True
+                threading.Thread(target=_refresh_pool_cache_async, args=(cluster_id,), daemon=True).start()
+            return cache_entry.get('data', {})
+    
+    # Cache too old or missing - do synchronous refresh (only on first load)
+    if cluster_id not in cluster_managers:
+        return cache_entry.get('data', {}) if cache_entry else {}
+    
+    try:
+        mgr = cluster_managers[cluster_id]
+        pools = mgr.get_pools()
+        
+        membership = {}
+        for pool in pools:
+            pool_id = pool.get('poolid')
+            if not pool_id:
+                continue
+            
+            try:
+                pool_data = mgr.get_pool_members(pool_id)
+                members = pool_data.get('members', [])
+                
+                for member in members:
+                    vmid = member.get('vmid')
+                    mtype = member.get('type')
+                    if vmid and mtype in ('qemu', 'lxc'):
+                        membership[f"{vmid}:{mtype}"] = pool_id
+            except:
+                continue
+        
+        with _pool_cache_lock:
+            _pool_membership_cache[cluster_id] = {
+                'data': membership,
+                'timestamp': now,
+                'refreshing': False
+            }
+        
+        logging.info(f"[POOL-CACHE] Initial cache for cluster {cluster_id}: {len(membership)} VMs in pools")
+        return membership
+        
+    except Exception as e:
+        logging.error(f"[POOL-CACHE] Error getting pool cache for {cluster_id}: {e}")
+        return cache_entry.get('data', {}) if cache_entry else {}
+
+def invalidate_pool_cache(cluster_id: str = None):
+    """Invalidate pool membership cache"""
+    global _pool_membership_cache
+    with _pool_cache_lock:
+        if cluster_id:
+            _pool_membership_cache.pop(cluster_id, None)
+        else:
+            _pool_membership_cache = {}
+
+def get_vm_pool_cached(cluster_id: str, vmid: int, vm_type: str = None) -> str:
+    """Get pool for a VM using cache
+    
+    Much faster than direct API calls - uses cached membership data
+    """
+    membership = get_pool_membership_cache(cluster_id)
+    
+    if vm_type:
+        # Exact match
+        return membership.get(f"{vmid}:{vm_type}")
+    else:
+        # Try both types
+        return membership.get(f"{vmid}:qemu") or membership.get(f"{vmid}:lxc")
+
 def get_vm_acls():
     """Get VM ACLs - always reload from disk to avoid stale cache issues
     
@@ -3662,17 +3981,19 @@ def invalidate_vm_acls_cache():
     global _vm_acls_cache
     _vm_acls_cache = None
 
-def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view') -> bool:
+def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str = 'vm.view', vm_type: str = None) -> bool:
     """Check if user can access a specific VM
     
     NS: Dec 2025 - VM ACLs are ADDITIVE, not restrictive
+    MK: Jan 2026 - Added Pool Permission support
     
     Logic:
     1. Admin always has access
     2. If user has VM-specific ACL entry:
        - inherit_role=True: User can do ALL VM operations (full access)
        - inherit_role=False: User can ONLY do operations listed in permissions
-    3. If user not in ACL: fall back to user's general role permissions
+    3. Check Pool Permissions (if VM is in a pool)
+    4. If user not in ACL: fall back to user's general role permissions
     
     LW: Changed inherit_role=True to mean "full VM access" instead of "use role perms"
     This is more intuitive - adding someone to a VM ACL should grant them access to that VM
@@ -3714,11 +4035,46 @@ def user_can_access_vm(user: dict, cluster_id: str, vmid: int, permission: str =
         else:
             logging.debug(f"[VM-ACL] User {username} NOT in ACL whitelist {allowed_users}")
         
-        # User not in ACL whitelist - fall through to check general permissions
+        # User not in ACL whitelist - fall through to check pool permissions
     else:
         logging.debug(f"[VM-ACL] No ACL found for VM {vmid} in cluster {cluster_id}")
     
-    # no VM-specific ACL or user not in whitelist - use general permissions
+    # MK: Check Pool Permissions - Jan 2026
+    # If VM is in a pool, check if user has permission via pool
+    # Uses cached pool membership data to avoid API calls on every permission check
+    try:
+        pool_id = get_vm_pool_cached(cluster_id, vmid, vm_type)
+        
+        if pool_id:
+            logging.debug(f"[POOL-PERM] VM {vmid} is in pool '{pool_id}' (cached)")
+            
+            # Get user's groups
+            user_groups = user.get('groups', [])
+            
+            # Get user's pool permissions from DB (not API)
+            db = get_db()
+            user_pool_perms = db.get_user_pool_permissions(cluster_id, username, user_groups)
+            
+            # Check if user has required permission for this pool
+            pool_perms = user_pool_perms.get(pool_id, [])
+            
+            if pool_perms:
+                # pool.admin grants all permissions
+                if 'pool.admin' in pool_perms:
+                    logging.debug(f"[POOL-PERM] User {username} has pool.admin for pool '{pool_id}'")
+                    return True
+                
+                if permission in pool_perms:
+                    logging.debug(f"[POOL-PERM] User {username} has {permission} for pool '{pool_id}'")
+                    return True
+                
+                logging.debug(f"[POOL-PERM] User {username} has pool perms {pool_perms} but not {permission}")
+            else:
+                logging.debug(f"[POOL-PERM] User {username} has no permissions for pool '{pool_id}'")
+    except Exception as e:
+        logging.error(f"[POOL-PERM] Error checking pool permission: {e}")
+    
+    # no VM-specific ACL or pool permission - use general permissions
     result = has_permission(user, permission)
     logging.debug(f"[VM-ACL] Fallback to general permission check for {permission}: {result}")
     return result
@@ -7478,7 +7834,12 @@ echo "AGENT_INSTALLED_OK"
         return result
     
     def _ssh_run_command_output(self, host: str, user: str, command: str, timeout: int = 30) -> str:
-        """Run SSH command and return output (or None on failure)"""
+        """Run SSH command and return output - HA PRIORITY (no rate limiting)
+        
+        NS: Jan 2026 - HA status checks bypass semaphore for immediate execution
+        """
+        _ssh_track_connection('ha', +1)
+        
         try:
             import subprocess
             result = subprocess.run(
@@ -7496,14 +7857,20 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             self.logger.debug(f"[SSH] Exception on {host}: {e}")
             return None
+        finally:
+            _ssh_track_connection('ha', -1)
     
     def _ssh_run_command_with_key_output(self, host: str, user: str, command: str, key: str, timeout: int = 30) -> str:
-        """Run SSH command with key and return output"""
+        """Run SSH command with key and return output - HA PRIORITY (no rate limiting)
+        
+        NS: Jan 2026 - HA operations bypass semaphore
+        """
+        _ssh_track_connection('ha', +1)
+        
         try:
             import subprocess
             import tempfile
             
-            # Write key to temp file
             with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.key') as f:
                 f.write(key)
                 key_file = f.name
@@ -7527,9 +7894,16 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             self.logger.debug(f"[SSH] Key exception on {host}: {e}")
             return None
+        finally:
+            _ssh_track_connection('ha', -1)
     
     def _ssh_run_command_with_password_output(self, host: str, user: str, command: str, password: str, timeout: int = 30) -> str:
-        """Run SSH command with password and return output"""
+        """Run SSH command with password and return output - HA PRIORITY (no rate limiting)
+        
+        NS: Jan 2026 - HA operations bypass semaphore
+        """
+        _ssh_track_connection('ha', +1)
+        
         try:
             import subprocess
             env = os.environ.copy()
@@ -7553,6 +7927,8 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             self.logger.debug(f"[SSH] Password exception on {host}: {e}")
             return None
+        finally:
+            _ssh_track_connection('ha', -1)
     
     # Legacy storage-based functions kept for advanced users who want extra safety
     def _ha_storage_heartbeat_init(self):
@@ -8331,16 +8707,24 @@ echo "AGENT_INSTALLED_OK"
         return disks
     
     def _ssh_run_command(self, host: str, user: str, command: str, key_file: str = None) -> bool:
-        """Run SSH command on remote host"""
-        ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes']
-        if key_file:
-            ssh_cmd.extend(['-i', key_file])
-        ssh_cmd.append(f'{user}@{host}')
-        ssh_cmd.append(command)
+        """Run SSH command on remote host - HA PRIORITY (no rate limiting)
         
-        self.logger.info(f"[HA] Running: ssh {user}@{host} '{command}'")
+        NS: Jan 2026 - HA operations bypass the semaphore because:
+        1. They are critical (fencing must happen immediately)
+        2. They are short (< 5 seconds typically)
+        3. They are rare (only during actual failures)
+        """
+        _ssh_track_connection('ha', +1)
         
         try:
+            ssh_cmd = ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10', '-o', 'BatchMode=yes']
+            if key_file:
+                ssh_cmd.extend(['-i', key_file])
+            ssh_cmd.append(f'{user}@{host}')
+            ssh_cmd.append(command)
+            
+            self.logger.info(f"[HA] Running: ssh {user}@{host} '{command}'")
+            
             result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=30)
             
             if result.returncode == 0:
@@ -8355,6 +8739,8 @@ echo "AGENT_INSTALLED_OK"
         except FileNotFoundError:
             self.logger.error(f"[HA] SSH not found")
             return False
+        finally:
+            _ssh_track_connection('ha', -1)
     
     def _ssh_run_command_with_key(self, host: str, user: str, command: str, key_content: str) -> bool:
         """Run SSH command using a private key from cluster config
@@ -8407,28 +8793,30 @@ echo "AGENT_INSTALLED_OK"
                     pass
     
     def _ssh_run_command_with_password(self, host: str, user: str, command: str, password: str) -> bool:
-        """Run SSH command with password using sshpass
+        """Run SSH command with password using sshpass - HA PRIORITY (no rate limiting)
         
         MK: Security fix - use SSHPASS environment variable instead of
         command line argument. Command line args are visible in 'ps aux'!
+        
+        NS: Jan 2026 - HA operations bypass semaphore for immediate execution
         """
+        _ssh_track_connection('ha', +1)
+        
         try:
             # Check if sshpass is available
             which_result = subprocess.run(['which', 'sshpass'], capture_output=True)
             if which_result.returncode != 0:
                 self.logger.warning(f"[HA] sshpass not installed, trying without password...")
+                _ssh_track_connection('ha', -1)  # Will be tracked by _ssh_run_command
                 return self._ssh_run_command(host, user, command)
             
-            # Use -e flag to read password from SSHPASS environment variable
-            # This is more secure than -p which exposes password in process list
             ssh_cmd = [
-                'sshpass', '-e',  # Read from SSHPASS env var (secure)
+                'sshpass', '-e',
                 'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'ConnectTimeout=10',
                 f'{user}@{host}',
                 command
             ]
             
-            # Set up environment with password
             env = os.environ.copy()
             env['SSHPASS'] = password
             
@@ -8445,6 +8833,8 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             self.logger.error(f"[HA] SSH with password failed: {e}")
             return False
+        finally:
+            _ssh_track_connection('ha', -1)
     
     def _ha_clear_vm_lock(self, vmid: int, vm_type: str, target_node: str, original_node: str):
         
@@ -8842,8 +9232,19 @@ echo "AGENT_INSTALLED_OK"
             return []
     
     def add_vm_to_proxmox_ha(self, vmid: int, vm_type: str = 'vm', group: str = None, 
-                             max_restart: int = 3, max_relocate: int = 3) -> Dict:
+                             max_restart: int = 1, max_relocate: int = 1, state: str = 'started',
+                             comment: str = None) -> Dict:
+        """Add VM/CT to Proxmox native HA
         
+        Args:
+            vmid: VM or Container ID
+            vm_type: 'vm' or 'ct'
+            group: HA group name (optional)
+            max_restart: Max restart attempts (0-10)
+            max_relocate: Max relocate attempts (0-10)
+            state: Request state - 'started', 'stopped', 'ignored', 'disabled'
+            comment: Optional comment/description
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Not connected'}
@@ -8859,11 +9260,13 @@ echo "AGENT_INSTALLED_OK"
                 'sid': sid,
                 'max_restart': max_restart,
                 'max_relocate': max_relocate,
-                'state': 'started'
+                'state': state or 'started'
             }
             
             if group:
                 data['group'] = group
+            if comment:
+                data['comment'] = comment
             
             response = self._api_post(url, data=data)
             
@@ -9001,113 +9404,117 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"Error getting node IP: {e}")
             return None
     
-    def _ssh_connect(self, host: str):
-        # ssh connect
+    def _ssh_connect(self, host: str, retries: int = 3, retry_delay: float = 2.0):
+        """SSH connect with retry logic and connection rate limiting
+        
+        NS: Jan 2026 - Limits concurrent CONNECTION ATTEMPTS (not active sessions).
+        The semaphore is released after successful connection, allowing new
+        connections while this one is active. This prevents connection storms
+        while not blocking long-running operations.
+        
+        HA operations use separate methods without any rate limiting.
+        """
         paramiko = get_paramiko()
         if not paramiko:
             self.logger.error("paramiko not installed, cannot use SSH features")
             return None
         
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        # Get connection parameters
+        username = self.config.ssh_user if self.config.ssh_user else self.config.user.split('@')[0]
+        ssh_port = getattr(self.config, 'ssh_port', 22) or 22
+        ssh_key = getattr(self.config, 'ssh_key', '')
+        
+        for attempt in range(1, retries + 1):
+            # Rate limit connection ATTEMPTS (not active connections)
+            stats = get_ssh_connection_stats()
+            self.logger.debug(f"SSH queue: {stats['active_normal']} connecting, {stats['active_ha']} HA active")
             
-            # Use separate SSH user if configured, otherwise extract from Proxmox user
-            if self.config.ssh_user:
-                username = self.config.ssh_user
-            else:
-                username = self.config.user.split('@')[0]
+            acquired = _ssh_semaphore.acquire(timeout=120)
+            if not acquired:
+                self.logger.error(f"SSH to {host} queued too long (120s) - increase PEGAPROX_SSH_MAX_CONCURRENT")
+                return None
             
-            ssh_port = getattr(self.config, 'ssh_port', 22) or 22
+            _ssh_track_connection('normal', +1)
             
-            self.logger.info(f"Connecting to {host}:{ssh_port} as {username}...")
-            
-            # check we have an SSH key configured
-            ssh_key = getattr(self.config, 'ssh_key', '')
-            
-            if ssh_key:
-                # Use SSH key authentication
-                self.logger.info("Using SSH key authentication")
-                try:
+            try:
+                if attempt > 1:
+                    self.logger.info(f"SSH retry {attempt}/{retries} to {host}...")
+                else:
+                    self.logger.info(f"Connecting to {host}:{ssh_port} as {username}...")
+                
+                ssh = paramiko.SSHClient()
+                ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                
+                connect_kwargs = {
+                    'hostname': host,
+                    'port': ssh_port,
+                    'username': username,
+                    'timeout': 30,
+                    'banner_timeout': 30,
+                    'allow_agent': False,
+                    'look_for_keys': False
+                }
+                
+                if ssh_key:
                     import io
-                    # Try to load the key (could be RSA, Ed25519, ECDSA, etc.)
                     key_file = io.StringIO(ssh_key)
-                    
-                    # Try different key types
                     pkey = None
-                    key_types = [
+                    for key_name, key_class in [
                         ('RSA', paramiko.RSAKey),
                         ('Ed25519', paramiko.Ed25519Key),
                         ('ECDSA', paramiko.ECDSAKey),
                         ('DSA', paramiko.DSSKey)
-                    ]
-                    
-                    for key_name, key_class in key_types:
+                    ]:
                         try:
                             key_file.seek(0)
                             pkey = key_class.from_private_key(key_file)
-                            self.logger.info(f"Loaded {key_name} key")
                             break
-                        except Exception:
+                        except:
                             continue
                     
                     if not pkey:
                         self.logger.error("Could not load SSH key - unsupported format")
                         return None
                     
-                    ssh.connect(
-                        hostname=host,
-                        port=ssh_port,
-                        username=username,
-                        pkey=pkey,
-                        timeout=30,
-                        allow_agent=False,
-                        look_for_keys=False
-                    )
-                except Exception as e:
-                    self.logger.error(f"SSH key authentication failed: {e}")
-                    return None
-            else:
-                # Use password authentication
-                self.logger.info(f"Using password authentication for {username}@{host}:{ssh_port}")
-                try:
-                    ssh.connect(
-                        hostname=host,
-                        port=ssh_port,
-                        username=username,
-                        password=self.config.pass_,
-                        timeout=30,
-                        allow_agent=False,
-                        look_for_keys=False
-                    )
-                except paramiko.ssh_exception.AuthenticationException as e:
-                    error_str = str(e).lower()
-                    if 'publickey' in error_str or 'no supported' in error_str:
-                        self.logger.error(f"SSH requires public key authentication for {username}@{host}. Please configure an SSH key in cluster settings.")
-                        self.logger.error(f"Hint: The server may not allow password authentication. Check /etc/ssh/sshd_config on the node.")
-                    else:
-                        self.logger.error(f"SSH Authentication failed for {username}@{host}: {e}")
-                        self.logger.error(f"Hint: Check if the password is correct and the user '{username}' can SSH to the node.")
-                    return None
-                except paramiko.ssh_exception.NoValidConnectionsError as e:
-                    self.logger.error(f"SSH connection refused to {host}:{ssh_port} - is SSH enabled on the node? Error: {e}")
-                    return None
-                except Exception as e:
-                    self.logger.error(f"SSH password auth failed for {username}@{host}:{ssh_port}: {e}")
-                    return None
-            
-            self.logger.info(f"SSH connected to {host}")
-            return ssh
-            
-        except paramiko.ssh_exception.NoValidConnectionsError as e:
-            self.logger.error(f"SSH connection refused to {host} - is SSH enabled? Error: {e}")
-            return None
-        except socket.timeout:
-            self.logger.error(f"SSH connection to {host} timed out - check firewall/network")
-            return None
-        except Exception as e:
-            self.logger.error(f"SSH connection failed to {host}: {e}")
-            return None
+                    connect_kwargs['pkey'] = pkey
+                else:
+                    connect_kwargs['password'] = self.config.pass_
+                
+                ssh.connect(**connect_kwargs)
+                self.logger.info(f"SSH connected to {host}" + (f" (attempt {attempt})" if attempt > 1 else ""))
+                
+                # SUCCESS - release semaphore immediately, connection is established
+                # This allows new connections while this session runs
+                return ssh
+                
+            except paramiko.ssh_exception.AuthenticationException as e:
+                self.logger.error(f"SSH auth failed for {username}@{host}: {e}")
+                return None
+                
+            except (paramiko.ssh_exception.NoValidConnectionsError, socket.timeout, TimeoutError) as e:
+                if attempt < retries:
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    self.logger.warning(f"SSH to {host} failed (attempt {attempt}), retry in {delay}s...")
+                    time.sleep(delay)
+                    continue
+                self.logger.error(f"SSH to {host} failed after {retries} attempts: {e}")
+                return None
+                
+            except Exception as e:
+                if attempt < retries:
+                    delay = retry_delay * (2 ** (attempt - 1))
+                    self.logger.warning(f"SSH error (attempt {attempt}), retry in {delay}s: {e}")
+                    time.sleep(delay)
+                    continue
+                self.logger.error(f"SSH to {host} failed: {e}")
+                return None
+                
+            finally:
+                # Always release semaphore after attempt (success or failure)
+                _ssh_track_connection('normal', -1)
+                _ssh_semaphore.release()
+        
+        return None
     
     def _ssh_execute(self, ssh, command: str, task: UpdateTask = None) -> tuple:
         
@@ -9915,6 +10322,24 @@ echo "AGENT_INSTALLED_OK"
             if vm_config.get('cpu'):
                 data['cpu'] = vm_config['cpu']
             
+            # MK: CPU Affinity
+            if vm_config.get('cpu_affinity'):
+                data['affinity'] = vm_config['cpu_affinity']
+            
+            # MK: NUMA
+            if vm_config.get('numa'):
+                data['numa'] = '1'
+            
+            # MK: Advanced Memory - Ballooning
+            if vm_config.get('min_memory'):
+                data['balloon'] = vm_config['min_memory']
+            elif vm_config.get('ballooning') is False:
+                data['balloon'] = '0'  # Disable ballooning
+            
+            # MK: Memory Shares
+            if vm_config.get('shares'):
+                data['shares'] = vm_config['shares']
+            
             # BIOS
             if vm_config.get('bios'):
                 data['bios'] = vm_config['bios']
@@ -9980,6 +10405,50 @@ echo "AGENT_INSTALLED_OK"
             elif disk_type == 'sata':
                 data['sata0'] = disk_str
             
+            # MK: Additional Disks
+            additional_disks = vm_config.get('additional_disks', [])
+            disk_counters = {'scsi': 1, 'virtio': 1, 'sata': 1}  # Start at 1, 0 is primary
+            for add_disk in additional_disks:
+                add_type = add_disk.get('type', 'scsi')
+                add_storage = add_disk.get('storage', storage)
+                add_size = str(add_disk.get('size', '32')).replace('G', '').replace('g', '')
+                add_disk_str = f"{add_storage}:{add_size}"
+                
+                # MK: Use per-disk options - each disk has its own format, cache, discard, iothread, ssd
+                add_opts = []
+                
+                # Format: per-disk only (no fallback to global)
+                add_format = add_disk.get('format', '')
+                if add_format:
+                    add_opts.append(f"format={add_format}")
+                
+                # Cache: per-disk only
+                add_cache = add_disk.get('cache', '')
+                if add_cache:
+                    add_opts.append(f"cache={add_cache}")
+                
+                # Discard: per-disk (defaults to true in UI)
+                if add_disk.get('discard', True):
+                    add_opts.append("discard=on")
+                
+                # IO Thread for SCSI: per-disk (defaults to true in UI)
+                if add_disk.get('iothread', True) and add_type == 'scsi':
+                    add_opts.append("iothread=1")
+                
+                # SSD emulation: per-disk
+                if add_disk.get('ssd', False):
+                    add_opts.append("ssd=1")
+                
+                if add_opts:
+                    add_disk_str += "," + ",".join(add_opts)
+                
+                disk_idx = disk_counters.get(add_type, 1)
+                data[f"{add_type}{disk_idx}"] = add_disk_str
+                disk_counters[add_type] = disk_idx + 1
+                
+                # MK: If this disk uses a different SCSI controller, note it (Proxmox only allows one scsihw though)
+                # The per-disk scsihw is mostly for UI consistency; Proxmox uses one controller for all SCSI disks
+            
             # EFI disk for UEFI
             if vm_config.get('bios') == 'ovmf':
                 efi_storage = vm_config.get('efi_storage', storage)
@@ -10005,6 +10474,18 @@ echo "AGENT_INSTALLED_OK"
                 net_str += ",firewall=1"
             if vm_config.get('net_tag'):
                 net_str += f",tag={vm_config['net_tag']}"
+            # MK: MAC Address
+            if vm_config.get('net_macaddr'):
+                net_str += f",macaddr={vm_config['net_macaddr']}"
+            # MK: MTU
+            if vm_config.get('net_mtu'):
+                net_str += f",mtu={vm_config['net_mtu']}"
+            # MK: Rate Limit (MB/s -> Proxmox uses MB/s directly)
+            if vm_config.get('net_rate'):
+                net_str += f",rate={vm_config['net_rate']}"
+            # MK: Disconnect (link_down)
+            if vm_config.get('net_disconnect'):
+                net_str += ",link_down=1"
             data['net0'] = net_str
             
             # CD-ROM / ISO
@@ -10044,12 +10525,32 @@ echo "AGENT_INSTALLED_OK"
             # Start after creation
             start_after = vm_config.get('start', False)
             
+            # MK: HA config (will be applied after VM creation)
+            ha_enabled = vm_config.get('ha_enabled', False)
+            ha_group = vm_config.get('ha_group', '')
+            
             self.logger.info(f"Creating VM {vmid} on {node} with config: {data}")
             response = self._api_post(url, data=data)
             
             if response.status_code == 200:
                 task_data = response.json()
                 self.logger.info(f"[OK] VM {vmid} created, task: {task_data.get('data')}")
+                
+                # MK: Add to HA if enabled
+                if ha_enabled:
+                    try:
+                        ha_url = f"https://{self.host}:8006/api2/json/cluster/ha/resources"
+                        ha_data = {'sid': f"vm:{vmid}"}
+                        if ha_group:
+                            ha_data['group'] = ha_group
+                        ha_response = self._api_post(ha_url, data=ha_data)
+                        if ha_response.status_code == 200:
+                            self.logger.info(f"[OK] VM {vmid} added to HA")
+                        else:
+                            self.logger.warning(f"[WARN] Failed to add VM {vmid} to HA: {ha_response.text}")
+                    except Exception as ha_err:
+                        self.logger.warning(f"[WARN] HA config failed: {ha_err}")
+                
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -10059,6 +10560,7 @@ echo "AGENT_INSTALLED_OK"
         except Exception as e:
             self.logger.error(f"[ERROR] VM creation error: {e}")
             return {'success': False, 'error': str(e)}
+    
     
     def create_container(self, node: str, ct_config: Dict) -> Dict[str, Any]:
         
@@ -10086,7 +10588,7 @@ echo "AGENT_INSTALLED_OK"
             # MK: defaults are conservative, users can change later
             data = {
                 'vmid': vmid,
-                'hostname': ct_config.get('hostname', f'ct-{vmid}'),
+                'hostname': ct_config.get('hostname', ct_config.get('name', f'ct-{vmid}')),
                 'ostemplate': template,
                 'memory': ct_config.get('memory', 512),  # MB
                 'swap': ct_config.get('swap', 512),
@@ -10098,6 +10600,15 @@ echo "AGENT_INSTALLED_OK"
             storage = ct_config.get('storage', 'local-lvm')
             disk_size = ct_config.get('disk_size', '8')  # GB
             data['rootfs'] = f"{storage}:{disk_size}"
+            
+            # MK: Additional Mount Points
+            additional_disks = ct_config.get('additional_disks', [])
+            for idx, mp in enumerate(additional_disks):
+                mp_storage = mp.get('storage', storage)
+                mp_size = str(mp.get('size', '8')).replace('G', '').replace('g', '')
+                mp_path = mp.get('path', f'/mnt/data{idx}')
+                # Format: storage:size,mp=/path
+                data[f'mp{idx}'] = f"{mp_storage}:{mp_size},mp={mp_path}"
             
             # Network configuration
             # NS: this networking stuff is confusing, proxmox docs are not great
@@ -10142,6 +10653,18 @@ echo "AGENT_INSTALLED_OK"
             if ct_config.get('net_disconnected'):
                 net_str += ",link_down=1"
             
+            # MK: MAC Address
+            if ct_config.get('net_macaddr'):
+                net_str += f",hwaddr={ct_config['net_macaddr']}"
+            
+            # MK: MTU
+            if ct_config.get('net_mtu'):
+                net_str += f",mtu={ct_config['net_mtu']}"
+            
+            # MK: Rate Limit (MB/s)
+            if ct_config.get('net_rate'):
+                net_str += f",rate={ct_config['net_rate']}"
+            
             data['net0'] = net_str
             
             # DNS settings
@@ -10170,12 +10693,32 @@ echo "AGENT_INSTALLED_OK"
             if features:
                 data['features'] = ','.join(features)
             
+            # MK: HA config (will be applied after CT creation)
+            ha_enabled = ct_config.get('ha_enabled', False)
+            ha_group = ct_config.get('ha_group', '')
+            
             self.logger.info(f"Creating container {vmid} on {node}")
             response = self._api_post(url, data=data)
             
             if response.status_code == 200:
                 task_data = response.json()
                 self.logger.info(f"[OK] Container {vmid} created, task: {task_data.get('data')}")
+                
+                # MK: Add to HA if enabled
+                if ha_enabled:
+                    try:
+                        ha_url = f"https://{self.host}:8006/api2/json/cluster/ha/resources"
+                        ha_data = {'sid': f"ct:{vmid}"}
+                        if ha_group:
+                            ha_data['group'] = ha_group
+                        ha_response = self._api_post(ha_url, data=ha_data)
+                        if ha_response.status_code == 200:
+                            self.logger.info(f"[OK] Container {vmid} added to HA")
+                        else:
+                            self.logger.warning(f"[WARN] Failed to add CT {vmid} to HA: {ha_response.text}")
+                    except Exception as ha_err:
+                        self.logger.warning(f"[WARN] HA config failed: {ha_err}")
+                
                 return {'success': True, 'vmid': vmid, 'task': task_data.get('data')}
             else:
                 error_msg = response.text
@@ -11259,11 +11802,60 @@ echo "AGENT_INSTALLED_OK"
             self.logger.error(f"Error getting ISO list: {e}")
             return []
     
+    # MK: Resource Pools - Jan 2026
+    def get_pools(self) -> List[Dict]:
+        """Get all resource pools from Proxmox"""
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return []
+        
+        try:
+            host = self.current_host or self.config.host
+            url = f"https://{host}:8006/api2/json/pools"
+            response = self._api_get(url)
+            
+            if response.status_code == 200:
+                return response.json().get('data', [])
+            return []
+        except Exception as e:
+            self.logger.error(f"Error getting pools: {e}")
+            return []
+    
+    def get_pool_members(self, pool_id: str) -> Dict:
+        """Get pool details including members"""
+        if not self.is_connected:
+            if not self.connect_to_proxmox():
+                return {}
+        
+        try:
+            host = self.current_host or self.config.host
+            url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+            response = self._api_get(url)
+            
+            if response.status_code == 200:
+                return response.json().get('data', {})
+            return {}
+        except Exception as e:
+            self.logger.error(f"Error getting pool members: {e}")
+            return {}
+    
+    def get_vm_pool(self, vmid: int, vm_type: str = 'qemu') -> str:
+        """Get the pool a VM belongs to (if any)"""
+        pools = self.get_pools()
+        for pool in pools:
+            pool_data = self.get_pool_members(pool['poolid'])
+            members = pool_data.get('members', [])
+            for member in members:
+                if member.get('vmid') == vmid and member.get('type') == vm_type:
+                    return pool['poolid']
+        return None
+    
     def add_disk(self, node: str, vmid: int, vm_type: str, disk_config: Dict) -> Dict[str, Any]:
         """Add a new disk to VM or container
         
         LW: This was a pain to get right - Proxmox disk strings are weird
         MK: Jan 2026 - Added bus type detection for iothread/ssd support
+        MK: Fixed to use PUT instead of POST for config updates
         """
         if not self.is_connected:
             if not self.connect_to_proxmox():
@@ -11271,7 +11863,7 @@ echo "AGENT_INSTALLED_OK"
         
         try:
             storage = disk_config.get('storage', 'local-lvm')
-            size = disk_config.get('size', '32G')
+            size = str(disk_config.get('size', '32')).replace('G', '').replace('g', '')
             disk_id = disk_config.get('disk_id', 'scsi1')
             
             # MK: Determine bus type from disk_id (e.g., "scsi0" -> "scsi")
@@ -11284,7 +11876,7 @@ echo "AGENT_INSTALLED_OK"
             if vm_type == 'qemu':
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
                 
-                # Build disk string
+                # Build disk string - format is storage:size (size in GB without unit)
                 disk_str = f"{storage}:{size}"
                 
                 # Add optional parameters (only if supported by bus type)
@@ -11315,7 +11907,8 @@ echo "AGENT_INSTALLED_OK"
                 
                 data = {disk_id: mp_str}
             
-            response = self._api_post(url, data=data)
+            # MK: Use PUT for config updates (not POST)
+            response = self._api_put(url, data=data)
             
             if response.status_code == 200:
                 self.logger.info(f"[OK] Added disk {disk_id} to {vm_type}/{vmid}")
@@ -11327,24 +11920,98 @@ echo "AGENT_INSTALLED_OK"
             return {'success': False, 'error': str(e)}
     
     def remove_disk(self, node: str, vmid: int, vm_type: str, disk_id: str, delete_data: bool = False) -> Dict[str, Any]:
+        """
+        Remove disk from VM.
+        If delete_data=False: Only detach (disk becomes unused)
+        If delete_data=True: Detach AND delete the volume physically
         
+        MK: Fixed - after detach, disk becomes 'unused0' etc., so we need to delete that
+        """
         if not self.is_connected:
             if not self.connect_to_proxmox():
                 return {'success': False, 'error': 'Could not connect to Proxmox'}
         
         try:
+            # MK: First get the current disk config to know the volume path
+            volume_path = None
+            if delete_data:
+                config_result = self.get_vm_config(node, vmid, vm_type)
+                if config_result.get('success'):
+                    # MK: Structure is config_result['config']['raw'] - that's where disk IDs are
+                    parsed_config = config_result.get('config', {})
+                    raw_config = parsed_config.get('raw', {})
+                    disk_config = raw_config.get(disk_id, '')
+                    self.logger.info(f"[DEBUG] delete_data=True, disk_id={disk_id}, disk_config={disk_config}")
+                    # Parse volume path from disk config (e.g., "local-lvm:vm-100-disk-0,size=32G")
+                    if disk_config and ':' in str(disk_config):
+                        volume_path = disk_config.split(',')[0]  # Get storage:volume part
+                        self.logger.info(f"[DEBUG] volume_path={volume_path}")
+            
             if vm_type == 'qemu':
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/qemu/{vmid}/config"
             else:
                 url = f"https://{self.host}:8006/api2/json/nodes/{node}/lxc/{vmid}/config"
             
-            # First detach the disk
+            # First detach the disk from VM config
             data = {'delete': disk_id}
             response = self._api_put(url, data=data)
             
             if response.status_code == 200:
-                self.logger.info(f"[OK] Removed disk {disk_id} from {vm_type}/{vmid}")
-                return {'success': True, 'message': f'Disk {disk_id} removed'}
+                self.logger.info(f"[OK] Detached disk {disk_id} from {vm_type}/{vmid}")
+                
+                # MK: If delete_data is True, find the unused slot and delete it
+                if delete_data and volume_path:
+                    try:
+                        import time
+                        time.sleep(0.8)  # Wait for Proxmox to update config
+                        
+                        # Get updated config to find the unused slot with our volume
+                        new_config = self.get_vm_config(node, vmid, vm_type)
+                        if new_config.get('success'):
+                            # MK: Structure is new_config['config']['raw']
+                            parsed_config = new_config.get('config', {})
+                            raw_config = parsed_config.get('raw', {})
+                            
+                            # Find the unused slot containing our volume
+                            unused_slot = None
+                            for key, value in raw_config.items():
+                                if key.startswith('unused') and volume_path in str(value):
+                                    unused_slot = key
+                                    self.logger.info(f"[DEBUG] Found {volume_path} in {key}={value}")
+                                    break
+                            
+                            if unused_slot:
+                                # Delete the unused slot - this removes the volume
+                                delete_data_req = {'delete': unused_slot}
+                                delete_response = self._api_put(url, data=delete_data_req)
+                                if delete_response.status_code == 200:
+                                    self.logger.info(f"[OK] Deleted volume via {unused_slot}")
+                                    return {'success': True, 'message': f'Disk {disk_id} removed and deleted'}
+                                else:
+                                    self.logger.warning(f"[WARN] Failed to delete {unused_slot}: {delete_response.text}")
+                            else:
+                                self.logger.warning(f"[WARN] Could not find {volume_path} in unused slots. Raw config keys: {list(raw_config.keys())}")
+                                # Volume not found in unused - try direct storage API delete
+                                storage_name = volume_path.split(':')[0] if ':' in volume_path else None
+                                if storage_name:
+                                    import urllib.parse
+                                    encoded_volid = urllib.parse.quote(volume_path, safe='')
+                                    delete_url = f"https://{self.host}:8006/api2/json/nodes/{node}/storage/{storage_name}/content/{encoded_volid}"
+                                    delete_response = self._api_delete(delete_url)
+                                    if delete_response.status_code == 200:
+                                        self.logger.info(f"[OK] Deleted volume {volume_path} via storage API")
+                                        return {'success': True, 'message': f'Disk {disk_id} removed and deleted'}
+                                    else:
+                                        self.logger.warning(f"[WARN] Storage API delete failed: {delete_response.text}")
+                        
+                        return {'success': True, 'message': f'Disk {disk_id} detached (volume may still exist)'}
+                    except Exception as del_err:
+                        self.logger.warning(f"[WARN] Could not delete volume: {del_err}")
+                        return {'success': True, 'message': f'Disk {disk_id} detached (volume deletion failed)'}
+                elif delete_data and not volume_path:
+                    self.logger.warning(f"[WARN] delete_data=True but volume_path is None - could not extract volume path from config")
+                
+                return {'success': True, 'message': f'Disk {disk_id} detached'}
             else:
                 return {'success': False, 'error': response.text}
                 
@@ -14134,9 +14801,11 @@ def setup_2fa():
         return jsonify({'error': '2FA not available. Please install pyotp and qrcode: pip install pyotp qrcode[pil]'}), 500
     
     username = request.session['user']
+    logging.info(f"2FA setup requested for user: {username}")  # MK: Debug
     users_db = load_users()
     
     if username not in users_db:
+        logging.warning(f"2FA setup failed - user not found: {username}")
         return jsonify({'error': 'User not found'}), 404
     
     user = users_db[username]
@@ -14147,6 +14816,7 @@ def setup_2fa():
     # Store pending secret (not activated yet)
     user['totp_pending_secret'] = secret
     save_users(users_db)
+    logging.info(f"2FA setup: saved pending secret for user {username}")  # MK: Debug
     
     # Generate provisioning URI
     totp = pyotp.TOTP(secret)
@@ -14179,21 +14849,25 @@ def verify_2fa_setup():
         return jsonify({'error': '2FA not available'}), 500
     
     data = request.get_json()
-    code = data.get('code', '')
+    code = data.get('code', '') if data else ''
     
     if not code:
+        logging.warning("2FA verify: no code provided")  # MK: Debug
         return jsonify({'error': 'TOTP code required'}), 400
     
     username = request.session['user']
+    logging.info(f"2FA verify requested for user: {username}, code length: {len(code)}")  # MK: Debug
     users_db = load_users()
     
     if username not in users_db:
+        logging.warning(f"2FA verify: user not found: {username}")
         return jsonify({'error': 'User not found'}), 404
     
     user = users_db[username]
     pending_secret = user.get('totp_pending_secret')
     
     if not pending_secret:
+        logging.warning(f"2FA verify: no pending secret for user {username}. User keys: {list(user.keys())}")  # MK: Debug
         return jsonify({'error': 'No pending 2FA setup'}), 400
     
     # Verify the code
@@ -15003,7 +15677,8 @@ def update_vm_tags(cluster_id, vmid):
     save_vm_tags(tags_db)
     
     user = request.session.get('user', 'system')
-    log_audit(user, 'vm.tags_updated', f"Updated tags for VM {vmid} in cluster {cluster_id}")
+    cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+    log_audit(user, 'vm.tags_updated', f"Updated tags for VM {vmid}", cluster=cluster_name)
     
     return jsonify({
         'success': True,
@@ -17775,9 +18450,10 @@ def set_vm_acl(cluster_id, vmid):
     save_vm_acls(acls)
     invalidate_vm_acls_cache()
     
+    cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
     log_audit(request.session['user'], 'vm.acl_updated', 
               f"VM {vmid} ACL updated: {len(users)} users, {len(permissions)} perms", 
-              cluster=cluster_id)
+              cluster=cluster_name)
     
     return jsonify({'success': True})
 
@@ -17797,12 +18473,536 @@ def delete_vm_acl(cluster_id, vmid):
         
         if deleted:
             invalidate_vm_acls_cache()
-            log_audit(request.session['user'], 'vm.acl_deleted', f"VM {vmid} ACL removed", cluster=cluster_id)
+            cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+            log_audit(request.session['user'], 'vm.acl_deleted', f"VM {vmid} ACL removed", cluster=cluster_name)
         
         return jsonify({'success': True, 'deleted': deleted})
     except Exception as e:
         logging.error(f"Failed to delete VM ACL: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+# ==================== RESOURCE POOLS - MK Jan 2026 ====================
+
+# Available pool permissions
+POOL_PERMISSIONS = [
+    'pool.view',        # View pool and members
+    'vm.start',         # Start VMs in pool
+    'vm.stop',          # Stop VMs in pool
+    'vm.console',       # Access VM console
+    'vm.config',        # Modify VM config
+    'vm.snapshot',      # Create/delete snapshots
+    'vm.backup',        # Create/restore backups
+    'vm.migrate',       # Migrate VMs
+    'vm.clone',         # Clone VMs
+    'vm.delete',        # Delete VMs
+    'pool.admin',       # Full admin access to pool
+]
+
+
+@app.route('/api/clusters/<cluster_id>/pools', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_cluster_pools(cluster_id):
+    """Get all resource pools from Proxmox"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    pools = mgr.get_pools()
+    
+    # Add pool member details
+    for pool in pools:
+        try:
+            details = mgr.get_pool_members(pool['poolid'])
+            members = details.get('members', [])
+            pool['members'] = members  # Include full members list for UI
+            pool['member_count'] = len(members)
+            pool['vms'] = len([m for m in members if m.get('type') in ('qemu', 'lxc')])
+            pool['storage'] = len([m for m in members if m.get('type') == 'storage'])
+        except:
+            pool['members'] = []
+            pool['member_count'] = 0
+            pool['vms'] = 0
+            pool['storage'] = 0
+    
+    # NS: Prevent caching to ensure fresh data after pool modifications
+    response = jsonify(pools)
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_pool_details(cluster_id, pool_id):
+    """Get pool details including members"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    pool_data = mgr.get_pool_members(pool_id)
+    
+    if not pool_data:
+        return jsonify({'error': 'Pool not found'}), 404
+    
+    return jsonify(pool_data)
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>/permissions', methods=['GET'])
+@require_auth(perms=['admin.users'])
+def get_pool_permissions_api(cluster_id, pool_id):
+    """Get permissions for a pool"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    db = get_db()
+    perms = db.get_pool_permissions(cluster_id, pool_id)
+    
+    return jsonify({
+        'pool_id': pool_id,
+        'permissions': perms,
+        'available_permissions': POOL_PERMISSIONS
+    })
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>/permissions', methods=['POST'])
+@require_auth(perms=['admin.users'])
+def add_pool_permission_api(cluster_id, pool_id):
+    """Add or update pool permission"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    data = request.json or {}
+    subject_type = data.get('subject_type')  # 'user' or 'group'
+    subject_id = data.get('subject_id')      # username or group name
+    permissions = data.get('permissions', [])
+    
+    if not subject_type or not subject_id:
+        return jsonify({'error': 'subject_type and subject_id required'}), 400
+    
+    if subject_type not in ('user', 'group'):
+        return jsonify({'error': 'subject_type must be "user" or "group"'}), 400
+    
+    # Validate permissions
+    invalid_perms = [p for p in permissions if p not in POOL_PERMISSIONS]
+    if invalid_perms:
+        return jsonify({'error': f'Invalid permissions: {invalid_perms}'}), 400
+    
+    db = get_db()
+    success = db.save_pool_permission(cluster_id, pool_id, subject_type, subject_id, permissions)
+    
+    if success:
+        cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+        log_audit(request.session['user'], 'pool.permission_updated', 
+                  f"Pool {pool_id}: {subject_type} '{subject_id}' permissions set to {permissions}", 
+                  cluster=cluster_name)
+        return jsonify({'success': True})
+    else:
+        return jsonify({'error': 'Failed to save permission'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>/permissions/<subject_type>/<subject_id>', methods=['DELETE'])
+@require_auth(perms=['admin.users'])
+def delete_pool_permission_api(cluster_id, pool_id, subject_type, subject_id):
+    """Delete pool permission"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    db = get_db()
+    deleted = db.delete_pool_permission(cluster_id, pool_id, subject_type, subject_id)
+    
+    if deleted:
+        cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+        log_audit(request.session['user'], 'pool.permission_deleted', 
+                  f"Pool {pool_id}: {subject_type} '{subject_id}' permission removed", 
+                  cluster=cluster_name)
+    
+    return jsonify({'success': True, 'deleted': deleted})
+
+
+@app.route('/api/clusters/<cluster_id>/pool-permissions', methods=['GET'])
+@require_auth(perms=['admin.users'])
+def get_all_pool_permissions_api(cluster_id):
+    """Get all pool permissions for a cluster"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    db = get_db()
+    perms = db.get_pool_permissions(cluster_id)
+    
+    # Group by pool
+    by_pool = {}
+    for p in perms:
+        pool_id = p['pool_id']
+        if pool_id not in by_pool:
+            by_pool[pool_id] = []
+        by_pool[pool_id].append(p)
+    
+    return jsonify({
+        'permissions': by_pool,
+        'available_permissions': POOL_PERMISSIONS
+    })
+
+
+@app.route('/api/clusters/<cluster_id>/pools/refresh-cache', methods=['POST'])
+@require_auth(perms=['admin.users'])
+def refresh_pool_cache_api(cluster_id):
+    """Manually refresh the pool membership cache for a cluster
+    
+    MK: Useful when pools have been modified in Proxmox
+    """
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    # Invalidate and refresh
+    invalidate_pool_cache(cluster_id)
+    membership = get_pool_membership_cache(cluster_id)
+    
+    return jsonify({
+        'success': True,
+        'vms_in_pools': len(membership),
+        'message': f'Cache refreshed - {len(membership)} VMs found in pools'
+    })
+
+
+# ============================================================================
+# Pool Management API - NS Jan 2026
+# Create, edit, delete pools and manage pool members directly from PegaProx
+# ============================================================================
+
+@app.route('/api/clusters/<cluster_id>/pools', methods=['POST'])
+@require_auth(perms=['admin.users'])
+def create_pool(cluster_id):
+    """Create a new resource pool in Proxmox"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    data = request.get_json() or {}
+    poolid = data.get('poolid', '').strip()
+    comment = data.get('comment', '').strip()
+    
+    if not poolid:
+        return jsonify({'error': 'Pool ID is required'}), 400
+    
+    # Validate pool ID (alphanumeric, dash, underscore only)
+    import re
+    if not re.match(r'^[a-zA-Z0-9_-]+$', poolid):
+        return jsonify({'error': 'Pool ID can only contain letters, numbers, dashes and underscores'}), 400
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    # Ensure connected
+    if not manager.is_connected:
+        if not manager.connect_to_proxmox():
+            return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
+    
+    try:
+        # Create pool via Proxmox API
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/pools"
+        
+        api_data = {'poolid': poolid}
+        if comment:
+            api_data['comment'] = comment
+        
+        response = manager._api_post(url, data=api_data)
+        
+        if response.status_code not in [200, 201]:
+            error_text = response.text
+            if 'already exists' in error_text.lower():
+                return jsonify({'error': f'Pool "{poolid}" already exists'}), 409
+            return jsonify({'error': f'Proxmox API error: {error_text}'}), 500
+        
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+        
+        audit_log(request.session.get('user'), 'pool.create', f'Created pool {poolid}', {'cluster': cluster_id, 'poolid': poolid})
+        
+        return jsonify({'success': True, 'poolid': poolid, 'message': f'Pool "{poolid}" created successfully'})
+    except Exception as e:
+        error_msg = str(e)
+        if 'already exists' in error_msg.lower():
+            return jsonify({'error': f'Pool "{poolid}" already exists'}), 409
+        return jsonify({'error': f'Failed to create pool: {error_msg}'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>', methods=['PUT'])
+@require_auth(perms=['admin.users'])
+def update_pool(cluster_id, pool_id):
+    """Update a pool's comment"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    data = request.get_json() or {}
+    comment = data.get('comment', '')
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    # Ensure connected
+    if not manager.is_connected:
+        if not manager.connect_to_proxmox():
+            return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        response = manager._api_put(url, data={'comment': comment})
+        
+        if response.status_code != 200:
+            return jsonify({'error': f'Proxmox API error: {response.text}'}), 500
+        
+        audit_log(request.session.get('user'), 'pool.update', f'Updated pool {pool_id}', {'cluster': cluster_id, 'poolid': pool_id})
+        
+        return jsonify({'success': True, 'message': f'Pool "{pool_id}" updated successfully'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to update pool: {str(e)}'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>', methods=['DELETE'])
+@require_auth(perms=['admin.users'])
+def delete_pool(cluster_id, pool_id):
+    """Delete a resource pool"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    # Ensure connected
+    if not manager.is_connected:
+        if not manager.connect_to_proxmox():
+            return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        response = manager._api_delete(url)
+        
+        if response.status_code != 200:
+            error_text = response.text
+            if 'not empty' in error_text.lower() or 'contains' in error_text.lower():
+                return jsonify({'error': 'Cannot delete pool - it still contains VMs or storage. Remove all members first.'}), 400
+            return jsonify({'error': f'Proxmox API error: {error_text}'}), 500
+        
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+        
+        # Also remove any PegaProx permissions for this pool
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM pool_permissions WHERE cluster_id = ? AND pool_id = ?', (cluster_id, pool_id))
+        conn.commit()
+        conn.close()
+        
+        audit_log(request.session.get('user'), 'pool.delete', f'Deleted pool {pool_id}', {'cluster': cluster_id, 'poolid': pool_id})
+        
+        return jsonify({'success': True, 'message': f'Pool "{pool_id}" deleted successfully'})
+    except Exception as e:
+        error_msg = str(e)
+        if 'not empty' in error_msg.lower() or 'contains' in error_msg.lower():
+            return jsonify({'error': 'Cannot delete pool - it still contains VMs or storage. Remove all members first.'}), 400
+        return jsonify({'error': f'Failed to delete pool: {error_msg}'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>/members', methods=['POST'])
+@require_auth(perms=['admin.users'])
+def add_pool_member(cluster_id, pool_id):
+    """Add a VM/CT to a pool"""
+    logging.info(f"add_pool_member called: cluster={cluster_id}, pool={pool_id}")
+    
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    data = request.get_json() or {}
+    vmid = data.get('vmid')
+    vm_type = data.get('type', 'qemu')  # qemu or lxc
+    
+    logging.info(f"Request data: vmid={vmid}, type={vm_type}")
+    
+    if not vmid:
+        return jsonify({'error': 'VMID is required'}), 400
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        logging.error(f"Cluster {cluster_id} not found in cluster_managers")
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    logging.info(f"Manager found: is_connected={manager.is_connected}")
+    
+    # Ensure connected
+    if not manager.is_connected:
+        logging.info("Manager not connected, attempting to connect...")
+        if not manager.connect_to_proxmox():
+            logging.error("Failed to connect to Proxmox")
+            return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
+    
+    try:
+        # Add VM to pool - Proxmox uses 'vms' parameter
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        
+        logging.info(f"Adding VM {vmid} to pool {pool_id} on {host}")
+        
+        # Proxmox expects form data with string values
+        response = manager._api_put(url, data={
+            'vms': str(vmid)
+        })
+        
+        logging.info(f"Proxmox response: {response.status_code} - {response.text[:200] if response.text else 'empty'}")
+        
+        if response.status_code != 200:
+            error_text = response.text
+            # Try to parse JSON error
+            try:
+                error_json = response.json()
+                error_text = error_json.get('errors', {}).get('vms', error_text)
+            except:
+                pass
+            return jsonify({'error': f'Proxmox API error: {error_text}'}), 500
+        
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+        
+        audit_log(request.session.get('user'), 'pool.member.add', f'Added VM {vmid} to pool {pool_id}', 
+                  {'cluster': cluster_id, 'poolid': pool_id, 'vmid': vmid})
+        
+        return jsonify({'success': True, 'message': f'VM {vmid} added to pool "{pool_id}"'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to add VM to pool: {str(e)}'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/pools/<pool_id>/members/<int:vmid>', methods=['DELETE'])
+@require_auth(perms=['admin.users'])
+def remove_pool_member(cluster_id, pool_id, vmid):
+    """Remove a VM/CT from a pool"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    # Ensure connected
+    if not manager.is_connected:
+        if not manager.connect_to_proxmox():
+            return jsonify({'error': 'Failed to connect to Proxmox cluster'}), 503
+    
+    try:
+        # Remove VM from pool using DELETE parameter
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/pools/{pool_id}"
+        response = manager._api_put(url, data={
+            'vms': str(vmid),
+            'delete': 1
+        })
+        
+        if response.status_code != 200:
+            return jsonify({'error': f'Proxmox API error: {response.text}'}), 500
+        
+        # Invalidate cache
+        invalidate_pool_cache(cluster_id)
+        
+        audit_log(request.session.get('user'), 'pool.member.remove', f'Removed VM {vmid} from pool {pool_id}', 
+                  {'cluster': cluster_id, 'poolid': pool_id, 'vmid': vmid})
+        
+        return jsonify({'success': True, 'message': f'VM {vmid} removed from pool "{pool_id}"'})
+    except Exception as e:
+        return jsonify({'error': f'Failed to remove VM from pool: {str(e)}'}), 500
+
+
+@app.route('/api/clusters/<cluster_id>/vms-without-pool', methods=['GET'])
+@require_auth()
+def get_vms_without_pool(cluster_id):
+    """Get all VMs that are not in any pool - useful for pool assignment UI"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager = cluster_managers.get(cluster_id)
+    if not manager:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    try:
+        # Get all VMs
+        all_vms = manager.get_vm_resources()
+        
+        # Get pool membership
+        membership = get_pool_membership_cache(cluster_id)
+        
+        # Filter VMs not in any pool
+        vms_without_pool = []
+        for vm in all_vms:
+            vmid = vm.get('vmid')
+            vm_type = vm.get('type', 'qemu')
+            key = f"{vmid}:{vm_type}"
+            
+            if key not in membership:
+                vms_without_pool.append({
+                    'vmid': vmid,
+                    'name': vm.get('name', f'VM {vmid}'),
+                    'type': vm_type,
+                    'status': vm.get('status', 'unknown'),
+                    'node': vm.get('node', '')
+                })
+        
+        return jsonify(vms_without_pool)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def check_pool_permission(cluster_id: str, vmid: int, vm_type: str, required_perm: str, user: str = None) -> bool:
+    """Check if user has permission for a VM via pool permissions
+    
+    Returns True if user has the required permission through pool membership
+    """
+    if user is None:
+        user = getattr(request, 'session', {}).get('user')
+    
+    if not user:
+        return False
+    
+    # Admins always have access
+    users = load_users()
+    user_data = users.get(user, {})
+    if user_data.get('role') == ROLE_ADMIN:
+        return True
+    
+    # Get the pool this VM belongs to
+    if cluster_id not in cluster_managers:
+        return False
+    
+    mgr = cluster_managers[cluster_id]
+    pool_id = mgr.get_vm_pool(vmid, vm_type)
+    
+    if not pool_id:
+        return False  # VM not in any pool
+    
+    # Get user's groups
+    user_groups = user_data.get('groups', [])
+    
+    # Get user's pool permissions
+    db = get_db()
+    user_pool_perms = db.get_user_pool_permissions(cluster_id, user, user_groups)
+    
+    # Check if user has required permission for this pool
+    pool_perms = user_pool_perms.get(pool_id, [])
+    
+    # pool.admin grants all permissions
+    if 'pool.admin' in pool_perms:
+        return True
+    
+    return required_perm in pool_perms
 
 
 @app.route('/api/users/<username>/vm-access', methods=['GET'])
@@ -18899,6 +20099,23 @@ def get_server_settings():
         settings['smtp_password'] = '********'
     return jsonify(settings)
 
+
+@app.route('/api/password-policy', methods=['GET'])
+def get_password_policy():
+    """Get password policy settings (public - needed for password change forms)
+    
+    NS: Jan 2026 - Returns only password-related settings, no auth required
+    """
+    settings = load_server_settings()
+    return jsonify({
+        'min_length': settings.get('password_min_length', 8),
+        'require_uppercase': settings.get('password_require_uppercase', True),
+        'require_lowercase': settings.get('password_require_lowercase', True),
+        'require_numbers': settings.get('password_require_numbers', True),
+        'require_special': settings.get('password_require_special', False),
+        'expiry_days': settings.get('password_expiry_days', 0)
+    })
+
 @app.route('/api/settings/server', methods=['POST'])
 @require_auth(roles=[ROLE_ADMIN])
 def update_server_settings():
@@ -19985,6 +21202,103 @@ def get_audit_log_api():
     
     return jsonify(entries)
 
+
+# MK: Cluster-specific audit endpoint with vmid filter
+@app.route('/api/clusters/<cluster_id>/audit', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_cluster_audit_log_api(cluster_id):
+    """Get audit log entries for a specific cluster, optionally filtered by vmid"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    # Get cluster name for filtering
+    cluster_name = None
+    if cluster_id in cluster_managers:
+        cluster_name = cluster_managers[cluster_id].config.name
+    
+    # Check if we're in multi-cluster mode
+    multi_cluster = len(cluster_managers) > 1
+    
+    # Optional filters
+    vmid = request.args.get('vmid')
+    limit = int(request.args.get('limit', 100))
+    
+    # Get from database
+    database = get_db()
+    entries = database.get_audit_log(limit=limit * 10)  # Get more to filter
+    
+    # Filter by cluster and vmid
+    filtered = []
+    for entry in entries:
+        entry_cluster = entry.get('cluster', '')
+        details = entry.get('details', '')
+        
+        # Cluster filter
+        if cluster_name:
+            detected_cluster = None
+            
+            # First check the cluster field
+            if entry_cluster:
+                detected_cluster = entry_cluster
+            else:
+                # Try to detect cluster from details text
+                import re
+                # Look for [SomeCluster] pattern at end
+                bracket_match = re.search(r'\[([^\]]+)\]\s*$', details)
+                if bracket_match:
+                    detected_cluster = bracket_match.group(1)
+                else:
+                    # Look for "for cluster X" or "cluster X" pattern
+                    cluster_match = re.search(r'(?:for )?cluster\s+(\S+)', details, re.IGNORECASE)
+                    if cluster_match:
+                        detected_cluster = cluster_match.group(1)
+            
+            # If we detected a cluster, it must match
+            if detected_cluster:
+                if detected_cluster != cluster_name:
+                    continue
+            else:
+                # No cluster info at all - skip in multi-cluster mode
+                if multi_cluster:
+                    continue
+        
+        # Check vmid filter
+        if vmid:
+            vmid_str = str(vmid)
+            vmid_found = False
+            
+            # Check for patterns in details
+            patterns = [
+                f"VM {vmid_str} ", f"VM {vmid_str}-", f"VM {vmid_str})",
+                f"CT {vmid_str} ", f"CT {vmid_str}-", f"CT {vmid_str})",
+                f"QEMU {vmid_str} ", f"QEMU {vmid_str}-", f"QEMU {vmid_str})",
+                f"LXC {vmid_str} ", f"LXC {vmid_str}-",
+                f"/{vmid_str} ", f"/{vmid_str})",
+                f"qemu/{vmid_str}", f"lxc/{vmid_str}",
+            ]
+            
+            for pattern in patterns:
+                if pattern in details:
+                    vmid_found = True
+                    break
+            
+            # Also check if details ends with the vmid pattern
+            if not vmid_found:
+                for ending in [f"VM {vmid_str}", f"CT {vmid_str}", f"QEMU {vmid_str}", f"LXC {vmid_str}"]:
+                    if details.endswith(ending):
+                        vmid_found = True
+                        break
+            
+            if not vmid_found:
+                continue
+        
+        filtered.append(entry)
+        if len(filtered) >= limit:
+            break
+    
+    return jsonify(filtered)
+
+
 @app.route('/api/audit/integrity', methods=['GET'])
 @require_auth(roles=[ROLE_ADMIN])
 def verify_audit_integrity():
@@ -20191,7 +21505,8 @@ def get_status():
         },
         'clusters_count': len(cluster_managers),
         'totp_available': TOTP_AVAILABLE,
-        'gevent_available': GEVENT_AVAILABLE
+        'gevent_available': GEVENT_AVAILABLE,
+        'ssh': get_ssh_connection_stats()  # NS: Jan 2026 - SSH connection pool stats
     })
 
 @app.route('/api/clusters', methods=['GET'])
@@ -21371,6 +22686,78 @@ def get_proxmox_ha_groups(cluster_id):
     return jsonify(cluster_managers[cluster_id].get_proxmox_ha_groups())
 
 
+# MK: Create HA Group
+@app.route('/api/clusters/<cluster_id>/proxmox-ha/groups', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN], perms=['ha.config'])
+def create_proxmox_ha_group(cluster_id):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    data = request.json or {}
+    group_name = data.get('group')
+    nodes = data.get('nodes')
+    
+    if not group_name or not nodes:
+        return jsonify({'error': 'group and nodes required'}), 400
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/ha/groups"
+        
+        payload = {
+            'group': group_name,
+            'nodes': nodes
+        }
+        if data.get('restricted'):
+            payload['restricted'] = 1
+        if data.get('nofailback'):
+            payload['nofailback'] = 1
+        if data.get('comment'):
+            payload['comment'] = data['comment']
+        
+        resp = manager._api_post(url, data=payload)
+        
+        if resp.status_code == 200:
+            usr = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(usr, 'ha.group_created', f"HA group '{group_name}' created", cluster=manager.config.name)
+            return jsonify({'success': True})
+        else:
+            return jsonify({'error': resp.text}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# MK: Delete HA Group
+@app.route('/api/clusters/<cluster_id>/proxmox-ha/groups/<group_name>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN], perms=['ha.config'])
+def delete_proxmox_ha_group(cluster_id, group_name):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        url = f"https://{host}:8006/api2/json/cluster/ha/groups/{group_name}"
+        
+        resp = manager._api_delete(url)
+        
+        if resp.status_code == 200:
+            usr = getattr(request, 'session', {}).get('user', 'system')
+            log_audit(usr, 'ha.group_deleted', f"HA group '{group_name}' deleted", cluster=manager.config.name)
+            return jsonify({'success': True})
+        else:
+            return jsonify({'error': resp.text}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/clusters/<cluster_id>/proxmox-ha/resources', methods=['POST'])
 @require_auth(roles=[ROLE_ADMIN], perms=['ha.config'])
 def add_to_proxmox_ha(cluster_id):
@@ -21383,16 +22770,29 @@ def add_to_proxmox_ha(cluster_id):
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
     
-    vmid = data.get('vmid')
-    vm_type = data.get('type', 'vm')
+    logging.debug(f"[HA] Add resource request: {data}")
+    
+    # MK: Support both sid format (vm:100) and separate vmid/type
+    sid = data.get('sid', '').strip()
+    if sid and ':' in sid:
+        parts = sid.split(':')
+        vm_type = parts[0]  # vm or ct
+        vmid = parts[1]
+    else:
+        vmid = data.get('vmid')
+        vm_type = data.get('type', 'vm')
+    
     group = data.get('group')
-    max_restart = data.get('max_restart', 3)
-    max_relocate = data.get('max_relocate', 3)
+    max_restart = data.get('max_restart', 1)
+    max_relocate = data.get('max_relocate', 1)
+    state = data.get('state', 'started')
+    comment = data.get('comment', '')
     
     if not vmid:
-        return jsonify({'error': 'vmid required'}), 400
+        logging.warning(f"[HA] Add resource failed: no vmid/sid in request data: {data}")
+        return jsonify({'error': 'vmid or sid required (format: vm:100 or ct:101)'}), 400
     
-    result = mgr.add_vm_to_proxmox_ha(vmid, vm_type, group, max_restart, max_relocate)
+    result = mgr.add_vm_to_proxmox_ha(vmid, vm_type, group, max_restart, max_relocate, state, comment)
     
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
@@ -21412,6 +22812,38 @@ def remove_from_proxmox_ha(cluster_id, vm_type, vmid):
         return jsonify({'error': 'Cluster not found'}), 404
     
     mgr = cluster_managers[cluster_id]
+    result = mgr.remove_vm_from_proxmox_ha(vmid, vm_type)
+    
+    if result['success']:
+        usr = getattr(request, 'session', {}).get('user', 'system')
+        log_audit(usr, 'ha.vm_removed', f"{vm_type.upper()} {vmid} removed from HA", cluster=mgr.config.name)
+        return jsonify(result)
+    else:
+        return jsonify(result), 400
+
+
+# MK: Alternative DELETE endpoint that accepts full sid string like "vm:100"
+@app.route('/api/clusters/<cluster_id>/proxmox-ha/resources/<sid>', methods=['DELETE'])
+@require_auth(perms=['ha.config'])
+def remove_from_proxmox_ha_by_sid(cluster_id, sid):
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    if cluster_id not in cluster_managers:
+        return jsonify({'error': 'Cluster not found'}), 404
+    
+    mgr = cluster_managers[cluster_id]
+    
+    # Parse sid (vm:100 or ct:101)
+    if ':' in sid:
+        vm_type, vmid = sid.split(':', 1)
+        try:
+            vmid = int(vmid)
+        except ValueError:
+            return jsonify({'error': f'Invalid VMID in sid: {sid}'}), 400
+    else:
+        return jsonify({'error': f'Invalid sid format: {sid}. Expected vm:VMID or ct:VMID'}), 400
+    
     result = mgr.remove_vm_from_proxmox_ha(vmid, vm_type)
     
     if result['success']:
@@ -24154,6 +25586,40 @@ def download_template(cluster_id):
         return jsonify({'error': str(e)}), 500
 
 
+@app.route('/api/clusters/<cluster_id>/nodes/<node>/storage/<storage>/content', methods=['GET'])
+@require_auth(perms=['storage.view'])
+def get_node_storage_content(cluster_id, node, storage):
+    """Get storage content for a specific node and storage
+    
+    Query params:
+    - content: Filter by content type (images, iso, vztmpl, backup, rootdir)
+    
+    MK: Added for Import Disk feature
+    """
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        content_type = request.args.get('content', '')
+        
+        url = f"https://{host}:8006/api2/json/nodes/{node}/storage/{storage}/content"
+        if content_type:
+            url += f"?content={content_type}"
+        
+        resp = manager._create_session().get(url, timeout=30)
+        
+        if resp.status_code == 200:
+            data = resp.json().get('data', [])
+            return jsonify(data)
+        else:
+            return jsonify([])
+    except Exception as e:
+        logging.error(f"Error getting storage content: {e}")
+        return jsonify([])
+
+
 @app.route('/api/clusters/<cluster_id>/nodes/<node>/storage/<storage>/download-url', methods=['POST'])
 @require_auth(perms=['storage.download'])
 def download_from_url(cluster_id, node, storage):
@@ -24410,6 +25876,13 @@ def create_vm_backup(cluster_id, node, vm_type, vmid):
     if error:
         return error
     
+    # MK: Check pool permission for vm.backup
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.backup', vm_type):
+        return jsonify({'error': 'Permission denied: vm.backup'}), 403
+    
     data = request.json or {}
     storage = data.get('storage', 'local')
     mode = data.get('mode', 'snapshot')  # stop, suspend, snapshot
@@ -24458,6 +25931,13 @@ def restore_vm_backup(cluster_id, node, vm_type, vmid):
     manager, error = get_connected_manager(cluster_id)
     if error:
         return error
+    
+    # MK: Check pool permission for vm.backup
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.backup', vm_type):
+        return jsonify({'error': 'Permission denied: vm.backup'}), 403
     
     data = request.json or {}
     volid = data.get('volid')
@@ -24567,6 +26047,40 @@ def get_replication_jobs(cluster_id):
         return jsonify([])
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# MK: HA Manager Status API
+@app.route('/api/clusters/<cluster_id>/datacenter/ha/status', methods=['GET'])
+@require_auth(perms=['cluster.view'])
+def get_ha_manager_status(cluster_id):
+    """Get Proxmox HA manager status (quorum, master, lrm nodes)"""
+    ok, err = check_cluster_access(cluster_id)
+    if not ok: return err
+    
+    manager, error = get_connected_manager(cluster_id)
+    if error:
+        return error
+    
+    try:
+        host = manager.current_host or manager.config.host
+        
+        # Get manager status (quorum, master, lrm for each node)
+        url = f"https://{host}:8006/api2/json/cluster/ha/status/manager_status"
+        resp = manager._create_session().get(url, timeout=30)
+        
+        if resp.status_code == 200:
+            data = resp.json().get('data', {})
+            return jsonify(data)
+        else:
+            # Fallback to current status
+            url2 = f"https://{host}:8006/api2/json/cluster/ha/status/current"
+            resp2 = manager._create_session().get(url2, timeout=30)
+            if resp2.status_code == 200:
+                return jsonify(resp2.json().get('data', []))
+            return jsonify([])
+    except Exception as e:
+        logging.error(f"Error getting HA manager status: {e}")
+        return jsonify([])
 
 
 # Firewall API
@@ -25504,7 +27018,8 @@ def vm_action_api(cluster_id, node, vm_type, vmid, action):
     required_perm = perm_map.get(action, 'vm.start')
     
     # LW: Use VM-specific ACL check instead of general permission
-    if not user_can_access_vm(user, cluster_id, vmid, required_perm):
+    # MK: Added vm_type for pool permission check
+    if not user_can_access_vm(user, cluster_id, vmid, required_perm, vm_type):
         logging.warning(f"[VM-ACTION] Permission denied for {request.session['user']}: {required_perm} on VM {vmid}")
         return jsonify({'error': f'Permission denied: {required_perm}'}), 403
     
@@ -25587,6 +27102,13 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.clone
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.clone', vm_type):
+        return jsonify({'error': 'Permission denied: vm.clone'}), 403
+    
     manager = cluster_managers[cluster_id]
     data = request.json or {}
     
@@ -25614,7 +27136,7 @@ def clone_vm_api(cluster_id, node, vm_type, vmid):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.cloned', f"{vm_type.upper()} {vmid} cloned to {newid}" + (f" as '{data.get('name')}'" if data.get('name') else ""))
+        log_audit(user, 'vm.cloned', f"{vm_type.upper()} {vmid} cloned to {newid}" + (f" as '{data.get('name')}'" if data.get('name') else ""), cluster=manager.config.name)
         return jsonify({
             'message': f'Clone gestartet: {vmid} -> {newid}',
             'newid': newid,
@@ -25640,7 +27162,8 @@ def get_console_ticket(cluster_id, node, vm_type, vmid):
     user = users.get(request.session['user'], {})
     user['username'] = request.session['user']
     
-    if not user_can_access_vm(user, cluster_id, vmid, 'vm.console'):
+    # MK: Added vm_type for pool permission check
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.console', vm_type):
         return jsonify({'error': 'Permission denied: vm.console'}), 403
     
     mgr = cluster_managers[cluster_id]
@@ -25793,6 +27316,13 @@ def update_vm_config_api(cluster_id, node, vm_type, vmid):
     
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
+    
+    # MK: Check pool permission for vm.config
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.config', vm_type):
+        return jsonify({'error': 'Permission denied: vm.config'}), 403
     
     manager = cluster_managers[cluster_id]
     config_updates = request.json or {}
@@ -26124,7 +27654,7 @@ def remove_passthrough_device(cluster_id, node, vmid, device_type, key):
         
         if response.status_code == 200:
             user = getattr(request, 'session', {}).get('user', 'system')
-            log_audit(user, f'vm.{device_type}_removed', f"VM {vmid}: Removed {key}")
+            log_audit(user, f'vm.{device_type}_removed', f"VM {vmid}: Removed {key}", cluster=manager.config.name)
             return jsonify({'message': f'Device {key} removed'})
         else:
             return jsonify({'error': response.text}), 500
@@ -26189,7 +27719,7 @@ def resize_vm_disk_api(cluster_id, node, vm_type, vmid):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.disk_resized', f"{vm_type.upper()} {vmid} disk {disk} resized to {size}")
+        log_audit(user, 'vm.disk_resized', f"{vm_type.upper()} {vmid} disk {disk} resized to {size}", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26247,7 +27777,7 @@ def add_disk_api(cluster_id, node, vm_type, vmid):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.disk_added', f"{vm_type.upper()} {vmid} - disk added: {disk_config.get('size', 'unknown')}GB on {disk_config.get('storage', 'default')}")
+        log_audit(user, 'vm.disk_added', f"{vm_type.upper()} {vmid} - disk added: {disk_config.get('size', 'unknown')}GB on {disk_config.get('storage', 'default')}", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26267,8 +27797,10 @@ def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
     # MK: First get current config to check boot order
     config_result = manager.get_vm_config(node, vmid, vm_type)
     old_boot = ''
-    if config_result['success']:
-        old_boot = config_result['config'].get('boot', '')
+    if config_result.get('success'):
+        # MK: Boot order is in raw config, not parsed
+        raw_config = config_result.get('config', {}).get('raw', {})
+        old_boot = raw_config.get('boot', '')
     
     result = manager.remove_disk(node, vmid, vm_type, disk_id, delete_data)
     
@@ -26294,7 +27826,7 @@ def remove_disk_api(cluster_id, node, vm_type, vmid, disk_id):
         
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.disk_removed', f"{vm_type.upper()} {vmid} - disk {disk_id} removed" + (" (data deleted)" if delete_data else ""))
+        log_audit(user, 'vm.disk_removed', f"{vm_type.upper()} {vmid} - disk {disk_id} removed" + (" (data deleted)" if delete_data else ""), cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26320,7 +27852,7 @@ def move_disk_api(cluster_id, node, vm_type, vmid, disk_id):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.disk_moved', f"{vm_type.upper()} {vmid} - disk {disk_id} moved to {target_storage}")
+        log_audit(user, 'vm.disk_moved', f"{vm_type.upper()} {vmid} - disk {disk_id} moved to {target_storage}", cluster=manager.config.name)
         return jsonify({'message': result['message'], 'task': result.get('task')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26361,7 +27893,7 @@ def add_network_api(cluster_id, node, vm_type, vmid):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.network_added', f"{vm_type.upper()} {vmid} - network added: bridge={net_config.get('bridge', 'default')}")
+        log_audit(user, 'vm.network_added', f"{vm_type.upper()} {vmid} - network added: bridge={net_config.get('bridge', 'default')}", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26382,7 +27914,7 @@ def update_network_api(cluster_id, node, vm_type, vmid, net_id):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.network_updated', f"{vm_type.upper()} {vmid} - network {net_id} updated")
+        log_audit(user, 'vm.network_updated', f"{vm_type.upper()} {vmid} - network {net_id} updated", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26402,7 +27934,7 @@ def remove_network_api(cluster_id, node, vm_type, vmid, net_id):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'vm.network_removed', f"{vm_type.upper()} {vmid} - network {net_id} removed")
+        log_audit(user, 'vm.network_removed', f"{vm_type.upper()} {vmid} - network {net_id} removed", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26432,7 +27964,7 @@ def toggle_network_link_api(cluster_id, node, vm_type, vmid, net_id):
     if result['success']:
         user = getattr(request, 'session', {}).get('user', 'system')
         action = 'disconnected' if link_down else 'connected'
-        log_audit(user, 'vm.network_link_toggle', f"QEMU {vmid} - network {net_id} {action}")
+        log_audit(user, 'vm.network_link_toggle', f"QEMU {vmid} - network {net_id} {action}", cluster=manager.config.name)
         return jsonify({'message': result['message']})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26474,6 +28006,13 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.snapshot
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
+        return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    
     mgr = cluster_managers[cluster_id]
     data = request.json or {}
     
@@ -26485,7 +28024,7 @@ def create_snapshot_api(cluster_id, node, vm_type, vmid):
     
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(usr, 'snapshot.created', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' created" + (" (with RAM)" if vmstate else ""))
+        log_audit(usr, 'snapshot.created', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' created" + (" (with RAM)" if vmstate else ""), cluster=mgr.config.name)
         return jsonify({'message': f'Snapshot {snapname} erstellt', 'task': result.get('task')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26500,12 +28039,19 @@ def delete_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.snapshot
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
+        return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    
     mgr = cluster_managers[cluster_id]
     result = mgr.delete_snapshot(node, vmid, vm_type, snapname)
     
     if result['success']:
         usr = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(usr, 'snapshot.deleted', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' deleted")
+        log_audit(usr, 'snapshot.deleted', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' deleted", cluster=mgr.config.name)
         return jsonify({'message': f'Snapshot deleted', 'task': result.get('task')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26520,13 +28066,20 @@ def rollback_snapshot_api(cluster_id, node, vm_type, vmid, snapname):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.snapshot
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.snapshot', vm_type):
+        return jsonify({'error': 'Permission denied: vm.snapshot'}), 403
+    
     mgr = cluster_managers[cluster_id]
     result = mgr.rollback_snapshot(node, vmid, vm_type, snapname)
     
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'snapshot.restored', f"{vm_type.upper()} {vmid} - rolled back to snapshot '{snapname}'")
+        log_audit(user, 'snapshot.restored', f"{vm_type.upper()} {vmid} - rolled back to snapshot '{snapname}'", cluster=mgr.config.name)
         return jsonify({'message': f'Rollback zu {snapname} gestartet', 'task': result.get('task')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -26674,7 +28227,7 @@ def snapshots_overview_delete():
             
             if result.get('success'):
                 deleted_count += 1
-                log_audit(user, 'snapshot.deleted', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' deleted")
+                log_audit(user, 'snapshot.deleted', f"{vm_type.upper()} {vmid} - snapshot '{snapname}' deleted", cluster=mgr.config.name)
             else:
                 errors.append(f"Failed to delete {snapname}: {result.get('error', 'Unknown error')}")
                 
@@ -26736,7 +28289,7 @@ def create_replication_job_api(cluster_id):
     if result['success']:
         # Audit log
         user = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(user, 'replication.created', f"VM {vmid} replication to {target_node} (schedule: {schedule}, cluster=manager.config.name)")
+        log_audit(user, 'replication.created', f"VM {vmid} replication to {target_node} (schedule: {schedule})", cluster=manager.config.name)
         return jsonify({'message': 'Replication Job erstellt', 'job_id': result.get('job_id')})
     else:
         return jsonify({'error': result['error']}), 500
@@ -28121,6 +29674,13 @@ def migrate_vm_api(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.migrate
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.migrate', vm_type):
+        return jsonify({'error': 'Permission denied: vm.migrate'}), 403
+    
     manager = cluster_managers[cluster_id]
     data = request.json or {}
     target_node = data.get('target')
@@ -28166,6 +29726,13 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
+    # MK: Check pool permission for vm.delete
+    users = load_users()
+    user = users.get(request.session['user'], {})
+    user['username'] = request.session['user']
+    if not user_can_access_vm(user, cluster_id, vmid, 'vm.delete', vm_type):
+        return jsonify({'error': 'Permission denied: vm.delete'}), 403
+    
     manager = cluster_managers[cluster_id]
     data = request.json or {}
     purge = data.get('purge', False)
@@ -28175,7 +29742,7 @@ def delete_vm_api(cluster_id, node, vm_type, vmid):
     
     if result.get('success'):
         usr = getattr(request, 'session', {}).get('user', 'system')
-        log_audit(usr, 'vm.deleted', f"{vm_type.upper()} {vmid} deleted from {node}" + (" (purged)" if purge else ""))
+        log_audit(usr, 'vm.deleted', f"{vm_type.upper()} {vmid} deleted from {node}" + (" (purged)" if purge else ""), cluster=manager.config.name)
         broadcast_action('delete', vm_type, str(vmid), {'node': node, 'purge': purge}, cluster_id, usr)
         return jsonify({'message': f'{vm_type.upper()} {vmid} deleted', 'task': result.get('task')})
     else:
@@ -28205,7 +29772,7 @@ def bulk_migrate_api(cluster_id):
         return jsonify({'error': 'No VMs specified'}), 400
     
     user = getattr(request, 'session', {}).get('user', 'system')
-    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}")
+    log_audit(user, 'vm.bulk_migrated', f"Bulk migration of {len(vms)} VMs to {target_node}", cluster=mgr.config.name)
     
     results = []
     for vm in vms:
@@ -28572,7 +30139,7 @@ def create_vm_api(cluster_id, node):
         user = getattr(request, 'session', {}).get('user', 'unknown')
         vmid = vm_config.get('vmid') or result.get('data', {}).get('vmid', 'unknown')
         vm_name = vm_config.get('name', f'vm-{vmid}')
-        log_audit(user, 'vm.create', f"Created VM {vmid} ({vm_name}) on {node}", cluster=cluster_id)
+        log_audit(user, 'vm.create', f"Created VM {vmid} ({vm_name}) on {node}", cluster=manager.config.name)
         
         # Broadcast to all clients
         broadcast_action('create', 'qemu', str(vmid), {'node': node, 'name': vm_name}, cluster_id, user)
@@ -28602,7 +30169,7 @@ def create_container_api(cluster_id, node):
         user = getattr(request, 'session', {}).get('user', 'unknown')
         vmid = ct_config.get('vmid') or result.get('data', {}).get('vmid', 'unknown')
         ct_name = ct_config.get('hostname', f'ct-{vmid}')
-        log_audit(user, 'container.create', f"Created CT {vmid} ({ct_name}) on {node}", cluster=cluster_id)
+        log_audit(user, 'container.create', f"Created CT {vmid} ({ct_name}) on {node}", cluster=manager.config.name)
         
         # Broadcast to all clients
         broadcast_action('create', 'lxc', str(vmid), {'node': node, 'name': ct_name}, cluster_id, user)
@@ -29003,7 +30570,7 @@ def get_node_replication_api(cluster_id, node):
 @app.route('/api/clusters/<cluster_id>/nodes/<node>/tasks', methods=['GET'])
 @require_auth(perms=['node.view'])
 def get_node_tasks_api(cluster_id, node):
-    """Get task history for node"""
+    """Get task history for node, optionally filtered by vmid"""
     if cluster_id not in cluster_managers:
         return jsonify({'error': 'Cluster not found'}), 404
     
@@ -29011,7 +30578,16 @@ def get_node_tasks_api(cluster_id, node):
     start = request.args.get('start', 0, type=int)
     limit = request.args.get('limit', 50, type=int)
     errors = request.args.get('errors', 'false').lower() == 'true'
-    return jsonify(manager.get_node_tasks(node, start, limit, errors))
+    vmid = request.args.get('vmid', None, type=int)
+    
+    tasks = manager.get_node_tasks(node, start, limit * 3 if vmid else limit, errors)  # Get more if filtering
+    
+    # Filter by vmid if specified
+    if vmid and tasks:
+        filtered = [t for t in tasks if t.get('id') == str(vmid) or str(vmid) in str(t.get('upid', ''))]
+        return jsonify(filtered[:limit])
+    
+    return jsonify(tasks)
 
 
 @app.route('/api/clusters/<cluster_id>/nodes/<node>/tasks/<path:upid>/log', methods=['GET'])
@@ -29726,6 +31302,10 @@ def deploy_smbios_autoconfig_all(cluster_id):
     for node in nodes:
         node_ip = node_ips.get(node, mgr.config.host)
         try:
+            # NS: Staggered connections to prevent SSH server overload
+            if results:  # Not the first node
+                time.sleep(1.0)
+            
             ssh = mgr._ssh_connect(node_ip)
             if not ssh:
                 results.append({'node': node, 'success': False, 'error': 'SSH connection failed'})
@@ -30069,7 +31649,8 @@ def run_custom_script(cluster_id, script_id):
     stored_salt = user_data.get('password_salt', '')
     stored_hash = user_data.get('password_hash', '')
     if not stored_salt or not stored_hash or not verify_password(password, stored_salt, stored_hash):
-        log_audit(usr, 'script.run_denied', f"Failed password verification for script execution (ID: {script_id})", cluster=cluster_id)
+        cluster_name = cluster_managers[cluster_id].config.name if cluster_id in cluster_managers else cluster_id
+        log_audit(usr, 'script.run_denied', f"Failed password verification for script execution (ID: {script_id})", cluster=cluster_name)
         return jsonify({'error': 'Invalid password'}), 401
     
     db = get_db()
@@ -33821,6 +35402,20 @@ def main(debug_mode=False):
     # Start password expiry check thread
     start_password_expiry_thread()
     print("Started password expiry check thread")
+    
+    # MK: Warm up pool membership cache for all clusters
+    # This prevents API calls during the first VM actions
+    def warmup_pool_cache():
+        time.sleep(5)  # Wait for cluster connections to establish
+        for cluster_id in cluster_managers:
+            try:
+                get_pool_membership_cache(cluster_id)
+                print(f"  Pool cache warmed for cluster: {cluster_id}")
+            except Exception as e:
+                print(f"  Warning: Could not warm pool cache for {cluster_id}: {e}")
+    
+    threading.Thread(target=warmup_pool_cache, daemon=True).start()
+    print("Started pool cache warmup thread")
     
     # Load server settings
     server_settings = load_server_settings()
