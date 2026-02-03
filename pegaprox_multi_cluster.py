@@ -111,7 +111,7 @@ import warnings
 # shut up asyncio
 warnings.filterwarnings('ignore', message='coroutine.*was never awaited')
 warnings.filterwarnings('ignore', category=RuntimeWarning, module='asyncio')
-from flask import Flask, jsonify, request, send_from_directory, Response, make_response
+from flask import Flask, jsonify, request, send_from_directory, Response, make_response, session
 from flask_cors import CORS
 from flask_sock import Sock
 from flask_compress import Compress  # NS: Gzip compression for faster loading
@@ -182,6 +182,25 @@ try:
 except ImportError:
     ARGON2_AVAILABLE = False
     # not a big deal, pbkdf2 fallback works fine
+
+# NS: External Authentication - LDAP support (Feb 2026)
+LDAP_AVAILABLE = False
+try:
+    import ldap
+    LDAP_AVAILABLE = True
+except ImportError:
+    pass  # Optional - LDAP auth won't be available
+
+# NS: External Authentication - OAuth2/OIDC support (Feb 2026)
+OIDC_AVAILABLE = False
+try:
+    from authlib.integrations.requests_client import OAuth2Session
+    from authlib.oauth2.rfc7636 import create_s256_code_challenge
+    import jwt
+    import httpx
+    OIDC_AVAILABLE = True
+except ImportError:
+    pass  # Optional - OAuth2/OIDC auth won't be available
 
 # from functools import lru_cache  # TODO add caching someday
 # import aiohttp  # maybe for async stuff later idk
@@ -1055,7 +1074,73 @@ class PegaProxDB:
         cursor.execute('''
             CREATE INDEX IF NOT EXISTS idx_pool_perms_pool ON pool_permissions(cluster_id, pool_id)
         ''')
-        
+
+        # NS: External Authentication tables - Feb 2026
+        # Support for LDAP (AD + OpenLDAP) and OAuth2/OIDC providers
+
+        # Auth providers table - stores LDAP and OIDC provider configurations
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_providers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                enabled INTEGER DEFAULT 1,
+                priority INTEGER DEFAULT 100,
+                config_encrypted TEXT NOT NULL,
+                default_role TEXT DEFAULT 'viewer',
+                auto_create_users INTEGER DEFAULT 0,
+                created_at TEXT,
+                updated_at TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_auth_providers_type ON auth_providers(type)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_auth_providers_enabled ON auth_providers(enabled)
+        ''')
+
+        # Group-to-role mappings for external providers
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS auth_group_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id TEXT NOT NULL,
+                external_group TEXT NOT NULL,
+                role TEXT NOT NULL,
+                tenant_id TEXT DEFAULT '_default',
+                priority INTEGER DEFAULT 100,
+                created_at TEXT,
+                FOREIGN KEY (provider_id) REFERENCES auth_providers(id) ON DELETE CASCADE,
+                UNIQUE(provider_id, external_group, tenant_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_group_mappings_provider ON auth_group_mappings(provider_id)
+        ''')
+
+        # User external identities - links PegaProx users to external IDs
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_external_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                external_username TEXT,
+                external_email TEXT,
+                external_groups TEXT DEFAULT '[]',
+                last_sync TEXT,
+                created_at TEXT,
+                FOREIGN KEY (provider_id) REFERENCES auth_providers(id) ON DELETE CASCADE,
+                UNIQUE(provider_id, external_id)
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_external_identities_user ON user_external_identities(username)
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_external_identities_provider ON user_external_identities(provider_id)
+        ''')
+
         # Schema migrations for existing databases
         # Add password_salt column if it doesn't exist (for databases created before this fix)
         try:
@@ -1117,7 +1202,16 @@ class PegaProxDB:
                     logging.info("Added totp_pending_secret_encrypted column to users table")
                 except Exception as e:
                     logging.error(f"Failed to add totp_pending_secret_encrypted column: {e}")
-                    
+
+            # NS: Add auth_source column for external authentication - Feb 2026
+            if 'auth_source' not in columns:
+                logging.info("Adding auth_source column to users table...")
+                try:
+                    cursor.execute("ALTER TABLE users ADD COLUMN auth_source TEXT DEFAULT 'local'")
+                    logging.info("Added auth_source column to users table")
+                except Exception as e:
+                    logging.error(f"Failed to add auth_source column: {e}")
+
         except Exception as e:
             logging.error(f"Error checking users schema: {e}")
         
@@ -3112,7 +3206,328 @@ class PegaProxDB:
         """Save all server settings"""
         for key, value in settings.items():
             self.save_server_setting(key, value)
-    
+
+    # ========================================
+    # AUTH PROVIDER OPERATIONS - Feb 2026
+    # NS: LDAP and OAuth2/OIDC external authentication
+    # ========================================
+
+    def get_auth_providers(self, enabled_only: bool = False) -> list:
+        """Get all authentication providers
+
+        Args:
+            enabled_only: If True, only return enabled providers
+
+        Returns:
+            List of provider dicts with decrypted config
+        """
+        cursor = self.conn.cursor()
+        if enabled_only:
+            cursor.execute('SELECT * FROM auth_providers WHERE enabled = 1 ORDER BY priority ASC')
+        else:
+            cursor.execute('SELECT * FROM auth_providers ORDER BY priority ASC')
+
+        providers = []
+        for row in cursor.fetchall():
+            provider = {
+                'id': row['id'],
+                'name': row['name'],
+                'type': row['type'],
+                'enabled': bool(row['enabled']),
+                'priority': row['priority'],
+                'default_role': row['default_role'],
+                'auto_create_users': bool(row['auto_create_users']),
+                'created_at': row['created_at'],
+                'updated_at': row['updated_at'],
+            }
+            # Decrypt config
+            try:
+                config_json = self._decrypt(row['config_encrypted'])
+                provider['config'] = json.loads(config_json)
+            except Exception as e:
+                logging.error(f"Failed to decrypt config for provider {row['id']}: {e}")
+                provider['config'] = {}
+            providers.append(provider)
+
+        return providers
+
+    def get_auth_provider(self, provider_id: str) -> dict:
+        """Get single auth provider by ID
+
+        Returns:
+            Provider dict with decrypted config, or None if not found
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT * FROM auth_providers WHERE id = ?', (provider_id,))
+        row = cursor.fetchone()
+
+        if not row:
+            return None
+
+        provider = {
+            'id': row['id'],
+            'name': row['name'],
+            'type': row['type'],
+            'enabled': bool(row['enabled']),
+            'priority': row['priority'],
+            'default_role': row['default_role'],
+            'auto_create_users': bool(row['auto_create_users']),
+            'created_at': row['created_at'],
+            'updated_at': row['updated_at'],
+        }
+        # Decrypt config
+        try:
+            config_json = self._decrypt(row['config_encrypted'])
+            provider['config'] = json.loads(config_json)
+        except Exception as e:
+            logging.error(f"Failed to decrypt config for provider {provider_id}: {e}")
+            provider['config'] = {}
+
+        return provider
+
+    def save_auth_provider(self, provider: dict) -> bool:
+        """Save or update auth provider
+
+        Args:
+            provider: Provider dict with config to save
+
+        Returns:
+            True on success
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        # Encrypt the config
+        config_json = json.dumps(provider.get('config', {}))
+        config_encrypted = self._encrypt(config_json)
+
+        cursor.execute('''
+            INSERT OR REPLACE INTO auth_providers
+            (id, name, type, enabled, priority, config_encrypted, default_role,
+             auto_create_users, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT created_at FROM auth_providers WHERE id = ?), ?), ?)
+        ''', (
+            provider['id'],
+            provider.get('name', ''),
+            provider.get('type', 'oidc'),
+            1 if provider.get('enabled', True) else 0,
+            provider.get('priority', 100),
+            config_encrypted,
+            provider.get('default_role', 'viewer'),
+            1 if provider.get('auto_create_users', False) else 0,
+            provider['id'], now, now
+        ))
+        self.conn.commit()
+        return True
+
+    def delete_auth_provider(self, provider_id: str) -> bool:
+        """Delete auth provider and associated mappings
+
+        Returns:
+            True on success
+        """
+        cursor = self.conn.cursor()
+        # Foreign key ON DELETE CASCADE will handle mappings and identities
+        cursor.execute('DELETE FROM auth_providers WHERE id = ?', (provider_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_group_mappings(self, provider_id: str) -> list:
+        """Get group-to-role mappings for a provider
+
+        Returns:
+            List of mapping dicts sorted by priority
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT * FROM auth_group_mappings
+            WHERE provider_id = ?
+            ORDER BY priority ASC
+        ''', (provider_id,))
+
+        return [{
+            'id': row['id'],
+            'provider_id': row['provider_id'],
+            'external_group': row['external_group'],
+            'role': row['role'],
+            'tenant_id': row['tenant_id'],
+            'priority': row['priority'],
+            'created_at': row['created_at'],
+        } for row in cursor.fetchall()]
+
+    def save_group_mapping(self, mapping: dict) -> int:
+        """Save group-to-role mapping
+
+        Args:
+            mapping: Mapping dict with provider_id, external_group, role, etc.
+
+        Returns:
+            The mapping ID
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        if mapping.get('id'):
+            # Update existing
+            cursor.execute('''
+                UPDATE auth_group_mappings
+                SET external_group = ?, role = ?, tenant_id = ?, priority = ?
+                WHERE id = ?
+            ''', (
+                mapping['external_group'],
+                mapping['role'],
+                mapping.get('tenant_id', '_default'),
+                mapping.get('priority', 100),
+                mapping['id']
+            ))
+            return mapping['id']
+        else:
+            # Insert new
+            cursor.execute('''
+                INSERT INTO auth_group_mappings
+                (provider_id, external_group, role, tenant_id, priority, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                mapping['provider_id'],
+                mapping['external_group'],
+                mapping['role'],
+                mapping.get('tenant_id', '_default'),
+                mapping.get('priority', 100),
+                now
+            ))
+            self.conn.commit()
+            return cursor.lastrowid
+
+    def delete_group_mapping(self, mapping_id: int) -> bool:
+        """Delete group mapping by ID
+
+        Returns:
+            True if deleted
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM auth_group_mappings WHERE id = ?', (mapping_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def get_user_external_identities(self, username: str) -> list:
+        """Get external identities linked to a user
+
+        Returns:
+            List of identity dicts
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT ei.*, ap.name as provider_name, ap.type as provider_type
+            FROM user_external_identities ei
+            LEFT JOIN auth_providers ap ON ei.provider_id = ap.id
+            WHERE ei.username = ?
+        ''', (username,))
+
+        return [{
+            'id': row['id'],
+            'username': row['username'],
+            'provider_id': row['provider_id'],
+            'provider_name': row['provider_name'],
+            'provider_type': row['provider_type'],
+            'external_id': row['external_id'],
+            'external_username': row['external_username'],
+            'external_email': row['external_email'],
+            'external_groups': json.loads(row['external_groups'] or '[]'),
+            'last_sync': row['last_sync'],
+            'created_at': row['created_at'],
+        } for row in cursor.fetchall()]
+
+    def link_external_identity(self, username: str, provider_id: str, external_id: str,
+                               external_username: str = None, external_email: str = None,
+                               external_groups: list = None) -> bool:
+        """Link external identity to a PegaProx user
+
+        Args:
+            username: PegaProx username
+            provider_id: Auth provider ID
+            external_id: External unique ID (LDAP DN or OIDC sub)
+            external_username: Username from external provider
+            external_email: Email from external provider
+            external_groups: List of groups from external provider
+
+        Returns:
+            True on success
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_external_identities
+            (username, provider_id, external_id, external_username, external_email,
+             external_groups, last_sync, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT created_at FROM user_external_identities
+                              WHERE provider_id = ? AND external_id = ?), ?))
+        ''', (
+            username,
+            provider_id,
+            external_id,
+            external_username,
+            external_email,
+            json.dumps(external_groups or []),
+            now,
+            provider_id, external_id, now
+        ))
+        self.conn.commit()
+        return True
+
+    def unlink_external_identity(self, identity_id: int) -> bool:
+        """Remove external identity link
+
+        Returns:
+            True if deleted
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM user_external_identities WHERE id = ?', (identity_id,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def find_user_by_external_id(self, provider_id: str, external_id: str) -> str:
+        """Find PegaProx username by external ID
+
+        Args:
+            provider_id: Auth provider ID
+            external_id: External unique ID
+
+        Returns:
+            Username if found, None otherwise
+        """
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT username FROM user_external_identities
+            WHERE provider_id = ? AND external_id = ?
+        ''', (provider_id, external_id))
+        row = cursor.fetchone()
+        return row['username'] if row else None
+
+    def update_external_identity_groups(self, provider_id: str, external_id: str,
+                                        groups: list) -> bool:
+        """Update external groups for an identity
+
+        Args:
+            provider_id: Auth provider ID
+            external_id: External unique ID
+            groups: Updated list of groups
+
+        Returns:
+            True if updated
+        """
+        cursor = self.conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute('''
+            UPDATE user_external_identities
+            SET external_groups = ?, last_sync = ?
+            WHERE provider_id = ? AND external_id = ?
+        ''', (json.dumps(groups), now, provider_id, external_id))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     # ========================================
     # TENANTS OPERATIONS
     # ========================================
@@ -14374,37 +14789,115 @@ def auth_login():
     # Reload users in case they were updated
     # NS: had a bug where user changes werent reflected until restart
     users_db = load_users()
-    
-    # check user exists
-    if username not in users_db:
-        logging.warning(f"Login attempt for unknown user: {username} from {client_ip}")
-        locked = record_failed_attempt()  # Don't track by username for unknown users
-        if locked:
-            return jsonify({
-                'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
-                'locked': True,
-                'retry_after': lockout_time
-            }), 429
-        return jsonify({'error': 'Invalid credentials'}), 401
-    
+
+    # NS: External authentication support - Feb 2026
+    # Check for explicit provider_id or user's auth_source
+    provider_id = data.get('provider_id')
+    auth_result = None
+    used_provider = None
+    used_provider_type = None
+
+    if username in users_db:
+        user = users_db[username]
+
+        # check user is enabled
+        if not user.get('enabled', True):
+            logging.warning(f"Login attempt for disabled user: {username} from {client_ip}")
+            return jsonify({'error': 'Account is disabled'}), 401
+
+        auth_source = user.get('auth_source', 'local')
+
+        if provider_id:
+            # Explicit provider requested - use it
+            if provider_id.startswith('ldap'):
+                auth_result = authenticate_with_ldap(provider_id, username, password)
+                if auth_result.get('success'):
+                    used_provider = provider_id
+                    db = get_db()
+                    provider = db.get_auth_provider(provider_id)
+                    used_provider_type = provider.get('type') if provider else 'ldap_ad'
+        elif auth_source != 'local' and ':' in auth_source:
+            # User has external auth source (e.g., "ldap_ad:provider123")
+            parts = auth_source.split(':', 1)
+            if len(parts) == 2:
+                ext_type, ext_provider_id = parts
+                if ext_type in ('ldap_ad', 'ldap_openldap'):
+                    auth_result = authenticate_with_ldap(ext_provider_id, username, password)
+                    if auth_result.get('success'):
+                        used_provider = ext_provider_id
+                        used_provider_type = ext_type
+                    elif not auth_result.get('success'):
+                        # External auth failed
+                        logging.warning(f"External auth failed for user: {username} from {client_ip}")
+                        locked = record_failed_attempt(username)
+                        if locked:
+                            return jsonify({
+                                'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
+                                'locked': True,
+                                'retry_after': lockout_time
+                            }), 429
+                        return jsonify({'error': 'Invalid credentials'}), 401
+        else:
+            # Local authentication
+            if not verify_password(password, user['password_salt'], user['password_hash']):
+                logging.warning(f"Failed login attempt for user: {username} from {client_ip}")
+                locked = record_failed_attempt(username)
+                if locked:
+                    return jsonify({
+                        'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
+                        'locked': True,
+                        'retry_after': lockout_time
+                    }), 429
+                return jsonify({'error': 'Invalid credentials'}), 401
+    else:
+        # User not found locally - try enabled LDAP providers
+        ldap_providers = get_enabled_ldap_providers()
+
+        for provider in ldap_providers:
+            auth_result = authenticate_with_ldap(provider['id'], username, password)
+            if auth_result.get('success'):
+                used_provider = provider['id']
+                used_provider_type = provider['type']
+                break
+
+        if not auth_result or not auth_result.get('success'):
+            # No LDAP provider authenticated the user
+            logging.warning(f"Login attempt for unknown user: {username} from {client_ip}")
+            locked = record_failed_attempt()
+            if locked:
+                return jsonify({
+                    'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
+                    'locked': True,
+                    'retry_after': lockout_time
+                }), 429
+            return jsonify({'error': 'Invalid credentials'}), 401
+
+        # Handle auto-provisioning for new external user
+        db = get_db()
+        provider = db.get_auth_provider(used_provider)
+
+        if provider and provider.get('auto_create_users'):
+            success = create_external_user(
+                username=username,
+                provider_id=used_provider,
+                external_id=auth_result.get('external_id') or auth_result.get('user_dn'),
+                attributes=auth_result.get('attributes', {}),
+                groups=auth_result.get('groups', []),
+                provider_type=used_provider_type
+            )
+            if success:
+                users_db = load_users()  # Reload to get new user
+            else:
+                return jsonify({'error': 'Failed to create user'}), 500
+        else:
+            return jsonify({'error': 'User not provisioned in PegaProx'}), 401
+
+    # Sync user from external provider if authenticated externally
+    if used_provider and auth_result:
+        sync_user_from_external(username, used_provider, auth_result)
+        users_db = load_users()  # Reload to get updated role
+
     user = users_db[username]
-    
-    # check user is enabled
-    if not user.get('enabled', True):
-        logging.warning(f"Login attempt for disabled user: {username} from {client_ip}")
-        return jsonify({'error': 'Account is disabled'}), 401
-    
-    # Verify password
-    if not verify_password(password, user['password_salt'], user['password_hash']):
-        logging.warning(f"Failed login attempt for user: {username} from {client_ip}")
-        locked = record_failed_attempt(username)
-        if locked:
-            return jsonify({
-                'error': f'Too many failed attempts. Try again in {lockout_time} seconds.',
-                'locked': True,
-                'retry_after': lockout_time
-            }), 429
-        return jsonify({'error': 'Invalid credentials'}), 401
     
     # check 2FA is required
     if user.get('totp_enabled') and user.get('totp_secret'):
@@ -14510,6 +15003,230 @@ def auth_logout():
     response = jsonify({'success': True})
     response.delete_cookie('session_id')
     return response
+
+
+# ============================================
+# OAuth2/OIDC Flow Endpoints
+# NS: Feb 2026 - Support for external identity providers
+# ============================================
+
+# Store OIDC state temporarily (in production, use Redis or database)
+_oidc_states = {}
+
+@app.route('/api/auth/oidc/<provider_id>/authorize', methods=['GET'])
+def oidc_authorize(provider_id):
+    """Start OAuth2/OIDC authorization flow
+
+    Redirects user to the identity provider for authentication.
+    """
+    if not OIDC_AVAILABLE:
+        return jsonify({'error': 'OIDC not available - install authlib'}), 500
+
+    try:
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider or not provider.get('enabled'):
+            return jsonify({'error': 'Provider not found or disabled'}), 404
+
+        if provider.get('type') != AUTH_PROVIDER_OIDC:
+            return jsonify({'error': 'Provider is not OIDC type'}), 400
+
+        config = provider.get('config', {})
+        authenticator = OIDCAuthenticator(config, provider_id)
+
+        # Build redirect URI
+        # Use request host to support different access methods
+        scheme = 'https' if (request.is_secure or request.headers.get('X-Forwarded-Proto') == 'https') else 'http'
+        host = request.headers.get('X-Forwarded-Host') or request.host
+        redirect_uri = f"{scheme}://{host}/api/auth/oidc/{provider_id}/callback"
+
+        # Get authorization URL with PKCE
+        auth_url, state, code_verifier = authenticator.get_authorization_url(redirect_uri)
+
+        if not auth_url:
+            return jsonify({'error': 'Failed to generate authorization URL'}), 500
+
+        # Store state and code_verifier temporarily
+        _oidc_states[state] = {
+            'provider_id': provider_id,
+            'code_verifier': code_verifier,
+            'redirect_uri': redirect_uri,
+            'created_at': time.time()
+        }
+
+        # Clean up old states (older than 5 minutes)
+        current_time = time.time()
+        expired = [s for s, v in _oidc_states.items() if current_time - v['created_at'] > 300]
+        for s in expired:
+            del _oidc_states[s]
+
+        # Redirect to IdP
+        from flask import redirect
+        return redirect(auth_url)
+
+    except Exception as e:
+        logging.error(f"OIDC authorize error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/oidc/<provider_id>/callback', methods=['GET'])
+def oidc_callback(provider_id):
+    """Handle OAuth2/OIDC callback from identity provider
+
+    Exchanges authorization code for tokens and creates session.
+    """
+    from flask import redirect
+
+    if not OIDC_AVAILABLE:
+        return redirect('/?error=oidc_unavailable')
+
+    try:
+        code = request.args.get('code')
+        state = request.args.get('state')
+        error = request.args.get('error')
+        error_description = request.args.get('error_description', '')
+
+        if error:
+            logging.warning(f"OIDC error from provider {provider_id}: {error} - {error_description}")
+            return redirect(f'/?error={error}&error_description={url_quote(error_description)}')
+
+        if not code or not state:
+            return redirect('/?error=missing_code_or_state')
+
+        # Validate state
+        if state not in _oidc_states:
+            logging.warning(f"OIDC invalid state for provider {provider_id}")
+            return redirect('/?error=invalid_state')
+
+        state_data = _oidc_states.pop(state)
+
+        if state_data['provider_id'] != provider_id:
+            logging.warning(f"OIDC state provider mismatch")
+            return redirect('/?error=provider_mismatch')
+
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider or not provider.get('enabled'):
+            return redirect('/?error=provider_disabled')
+
+        config = provider.get('config', {})
+        authenticator = OIDCAuthenticator(config, provider_id)
+
+        # Exchange code for tokens
+        tokens = authenticator.exchange_code(
+            code,
+            state_data['redirect_uri'],
+            state_data['code_verifier']
+        )
+
+        if 'error' in tokens:
+            logging.error(f"OIDC token exchange failed: {tokens['error']}")
+            return redirect(f"/?error=token_exchange_failed")
+
+        # Get user info
+        access_token = tokens.get('access_token')
+        user_info = authenticator.get_user_info(access_token)
+
+        if not user_info:
+            # Try to get info from ID token
+            id_token = tokens.get('id_token')
+            if id_token:
+                user_info = authenticator.validate_id_token(id_token)
+
+        if not user_info or not user_info.get('sub'):
+            logging.error("OIDC: Could not get user info")
+            return redirect('/?error=no_user_info')
+
+        # Extract user attributes using configured claims
+        claims = config.get('claims', {})
+        external_id = user_info.get('sub')
+        username_claim = claims.get('username', 'preferred_username')
+        groups_claim = claims.get('groups', 'groups')
+
+        raw_username = user_info.get(username_claim) or user_info.get('preferred_username') or user_info.get('email', '').split('@')[0]
+        username = sanitize_identifier(raw_username.lower(), max_length=64)
+        groups = user_info.get(groups_claim, [])
+
+        if not isinstance(groups, list):
+            groups = [groups] if groups else []
+
+        # Check if external ID is already linked to a user
+        existing_username = db.find_user_by_external_id(provider_id, external_id)
+        if existing_username:
+            username = existing_username
+
+        # Load or create user
+        users_db = load_users()
+
+        if username not in users_db:
+            # Auto-provision if enabled
+            if provider.get('auto_create_users'):
+                success = create_external_user(
+                    username=username,
+                    provider_id=provider_id,
+                    external_id=external_id,
+                    attributes={
+                        'username': raw_username,
+                        'email': user_info.get('email', ''),
+                        'display_name': user_info.get('name', raw_username)
+                    },
+                    groups=groups,
+                    provider_type=AUTH_PROVIDER_OIDC
+                )
+                if not success:
+                    return redirect('/?error=user_creation_failed')
+                users_db = load_users()
+            else:
+                logging.warning(f"OIDC: User {username} not provisioned and auto-create disabled")
+                return redirect('/?error=user_not_provisioned')
+
+        user = users_db[username]
+
+        # Check user is enabled
+        if not user.get('enabled', True):
+            return redirect('/?error=account_disabled')
+
+        # Sync user from OIDC
+        sync_user_from_external(username, provider_id, {
+            'external_id': external_id,
+            'groups': groups,
+            'attributes': user_info
+        })
+
+        # Reload user to get updated role
+        users_db = load_users()
+        user = users_db[username]
+
+        # Create session
+        session_id = create_session(username, user['role'])
+
+        # Update last login
+        user['last_login'] = datetime.now().isoformat()
+        save_users(users_db)
+
+        logging.info(f"User '{username}' logged in via OIDC provider {provider_id}")
+        log_audit(username, 'user.login', f"User logged in via OIDC ({provider.get('name', provider_id)})")
+
+        # Redirect to app with session cookie
+        response = make_response(redirect('/'))
+        is_secure = request.is_secure or request.headers.get('X-Forwarded-Proto') == 'https'
+        response.set_cookie(
+            'session_id',
+            session_id,
+            httponly=True,
+            samesite='Strict',
+            secure=is_secure,
+            max_age=get_session_timeout()
+        )
+
+        return response
+
+    except Exception as e:
+        logging.error(f"OIDC callback error: {e}")
+        return redirect(f'/?error=callback_error')
+
 
 @app.route('/api/auth/check', methods=['GET'])
 def auth_check():
@@ -19247,6 +19964,737 @@ def save_server_settings(settings):
 # Logo upload feature removed - NS: was never used in production
 
 
+# =============================================================================
+# EXTERNAL AUTHENTICATION - LDAP & OAUTH2/OIDC
+# NS: Feb 2026 - Support for Active Directory, OpenLDAP, and generic OIDC
+# =============================================================================
+
+# Provider type constants
+AUTH_PROVIDER_OIDC = 'oidc'
+AUTH_PROVIDER_LDAP_AD = 'ldap_ad'
+AUTH_PROVIDER_LDAP_OPENLDAP = 'ldap_openldap'
+
+
+class LDAPAuthenticator:
+    """LDAP/Active Directory authentication handler
+
+    Supports both Active Directory and OpenLDAP with automatic detection
+    of group membership retrieval method.
+
+    Config schema:
+    {
+        'server': 'ldaps://ldap.example.com:636',
+        'use_starttls': False,
+        'bind_dn': 'CN=service,DC=example,DC=com',
+        'bind_password': '...',
+        'base_dn': 'DC=example,DC=com',
+        'user_search_base': 'OU=Users,DC=example,DC=com',  # Optional, defaults to base_dn
+        'user_search_filter': '(sAMAccountName={username})',  # AD default
+        'user_attributes': {
+            'username': 'sAMAccountName',
+            'email': 'mail',
+            'display_name': 'displayName',
+            'groups': 'memberOf'  # AD only
+        },
+        'group_search_base': 'OU=Groups,DC=example,DC=com',  # For OpenLDAP
+        'group_search_filter': '(member={user_dn})',  # For OpenLDAP
+        'timeout': 10,
+        'ca_cert_path': None  # Optional: custom CA certificate
+    }
+    """
+
+    def __init__(self, config: dict, provider_type: str = AUTH_PROVIDER_LDAP_AD):
+        self.config = config
+        self.is_ad = provider_type == AUTH_PROVIDER_LDAP_AD
+
+    def authenticate(self, username: str, password: str) -> dict:
+        """Authenticate user against LDAP server
+
+        Args:
+            username: Username to authenticate
+            password: Password to verify
+
+        Returns:
+            dict with keys:
+                'success': bool
+                'user_dn': str (if successful)
+                'attributes': dict (email, display_name, etc.)
+                'groups': list (group DNs or names)
+                'error': str (if failed)
+        """
+        if not LDAP_AVAILABLE:
+            return {'success': False, 'error': 'LDAP library not installed'}
+
+        if not password:
+            return {'success': False, 'error': 'Password required'}
+
+        try:
+            # First, bind with service account to search for user
+            conn = self._get_connection()
+            if not conn:
+                return {'success': False, 'error': 'Could not connect to LDAP server'}
+
+            # Search for user
+            user_result = self._search_user(conn, username)
+            if not user_result:
+                conn.unbind_s()
+                return {'success': False, 'error': 'User not found'}
+
+            user_dn = user_result['dn']
+            attributes = user_result['attributes']
+
+            # Now try to bind as the user to verify password
+            try:
+                user_conn = self._get_connection(bind_dn=user_dn, bind_password=password)
+                if user_conn:
+                    user_conn.unbind_s()
+                else:
+                    conn.unbind_s()
+                    return {'success': False, 'error': 'Invalid credentials'}
+            except Exception as e:
+                conn.unbind_s()
+                logging.debug(f"LDAP user bind failed: {e}")
+                return {'success': False, 'error': 'Invalid credentials'}
+
+            # Get user groups
+            groups = self._get_user_groups(conn, user_dn, attributes)
+
+            conn.unbind_s()
+
+            return {
+                'success': True,
+                'user_dn': user_dn,
+                'external_id': user_dn,
+                'attributes': attributes,
+                'groups': groups
+            }
+
+        except Exception as e:
+            logging.error(f"LDAP authentication error: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def _get_connection(self, bind_dn: str = None, bind_password: str = None):
+        """Create LDAP connection with proper TLS settings
+
+        Args:
+            bind_dn: DN to bind with (defaults to service account)
+            bind_password: Password for bind
+
+        Returns:
+            ldap.LDAPObject or None
+        """
+        if not LDAP_AVAILABLE:
+            return None
+
+        try:
+            server = self.config.get('server', '')
+            timeout = self.config.get('timeout', 10)
+
+            # Set global options
+            ldap.set_option(ldap.OPT_NETWORK_TIMEOUT, timeout)
+            ldap.set_option(ldap.OPT_TIMEOUT, timeout)
+
+            # Handle CA certificate
+            ca_cert = self.config.get('ca_cert_path')
+            if ca_cert and os.path.exists(ca_cert):
+                ldap.set_option(ldap.OPT_X_TLS_CACERTFILE, ca_cert)
+
+            # Create connection
+            conn = ldap.initialize(server)
+            conn.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
+            conn.set_option(ldap.OPT_REFERRALS, 0)
+
+            # Handle StartTLS for non-ldaps connections
+            if self.config.get('use_starttls') and not server.startswith('ldaps://'):
+                conn.start_tls_s()
+
+            # Bind
+            dn = bind_dn or self.config.get('bind_dn', '')
+            pw = bind_password or self.config.get('bind_password', '')
+
+            if dn and pw:
+                conn.simple_bind_s(dn, pw)
+            else:
+                # Anonymous bind
+                conn.simple_bind_s('', '')
+
+            return conn
+
+        except ldap.INVALID_CREDENTIALS:
+            logging.debug("LDAP invalid credentials")
+            return None
+        except ldap.SERVER_DOWN:
+            logging.error(f"LDAP server down: {self.config.get('server')}")
+            return None
+        except Exception as e:
+            logging.error(f"LDAP connection error: {e}")
+            return None
+
+    def _search_user(self, conn, username: str) -> dict:
+        """Search for user in LDAP
+
+        Args:
+            conn: LDAP connection
+            username: Username to search for
+
+        Returns:
+            dict with 'dn' and 'attributes' or None
+        """
+        try:
+            base_dn = self.config.get('user_search_base') or self.config.get('base_dn', '')
+            search_filter = self.config.get('user_search_filter', '(sAMAccountName={username})')
+
+            # Replace placeholder with actual username (escape special chars)
+            search_filter = search_filter.replace('{username}', ldap.filter.escape_filter_chars(username))
+
+            # Attributes to retrieve
+            attr_map = self.config.get('user_attributes', {})
+            attrs = list(attr_map.values()) if attr_map else ['*']
+
+            results = conn.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, attrs)
+
+            for dn, entry in results:
+                if dn:  # Skip referrals
+                    attributes = {}
+                    for key, ldap_attr in attr_map.items():
+                        if ldap_attr in entry:
+                            val = entry[ldap_attr]
+                            if isinstance(val, list):
+                                # Decode bytes if necessary
+                                val = [v.decode('utf-8') if isinstance(v, bytes) else v for v in val]
+                                attributes[key] = val[0] if len(val) == 1 else val
+                            else:
+                                attributes[key] = val.decode('utf-8') if isinstance(val, bytes) else val
+
+                    # Store raw memberOf for AD
+                    if 'memberOf' in entry:
+                        attributes['_memberOf'] = [
+                            m.decode('utf-8') if isinstance(m, bytes) else m
+                            for m in entry['memberOf']
+                        ]
+
+                    return {'dn': dn, 'attributes': attributes}
+
+            return None
+
+        except Exception as e:
+            logging.error(f"LDAP user search error: {e}")
+            return None
+
+    def _get_user_groups(self, conn, user_dn: str, attributes: dict) -> list:
+        """Get user's group memberships
+
+        AD: Uses memberOf attribute (recursive group membership)
+        OpenLDAP: Searches for groups containing the user
+
+        Args:
+            conn: LDAP connection
+            user_dn: User's distinguished name
+            attributes: User attributes (may contain _memberOf for AD)
+
+        Returns:
+            List of group DNs or names
+        """
+        groups = []
+
+        if self.is_ad:
+            # Active Directory - use memberOf attribute
+            if '_memberOf' in attributes:
+                groups = attributes['_memberOf']
+        else:
+            # OpenLDAP - search for groups
+            try:
+                group_base = self.config.get('group_search_base') or self.config.get('base_dn', '')
+                group_filter = self.config.get('group_search_filter', '(member={user_dn})')
+                group_filter = group_filter.replace('{user_dn}', ldap.filter.escape_filter_chars(user_dn))
+
+                results = conn.search_s(group_base, ldap.SCOPE_SUBTREE, group_filter, ['cn', 'dn'])
+
+                for dn, entry in results:
+                    if dn:
+                        groups.append(dn)
+
+            except Exception as e:
+                logging.error(f"LDAP group search error: {e}")
+
+        return groups
+
+    def test_connection(self) -> dict:
+        """Test LDAP connection and binding
+
+        Returns:
+            dict with 'success' and 'message' or 'error'
+        """
+        if not LDAP_AVAILABLE:
+            return {'success': False, 'error': 'LDAP library not installed (pip install python-ldap)'}
+
+        try:
+            conn = self._get_connection()
+            if conn:
+                # Try a simple search to verify
+                base_dn = self.config.get('base_dn', '')
+                conn.search_s(base_dn, ldap.SCOPE_BASE, '(objectClass=*)', ['1.1'])
+                conn.unbind_s()
+                return {'success': True, 'message': 'Connection successful'}
+            else:
+                return {'success': False, 'error': 'Could not establish connection'}
+
+        except ldap.INVALID_CREDENTIALS:
+            return {'success': False, 'error': 'Invalid bind credentials'}
+        except ldap.SERVER_DOWN:
+            return {'success': False, 'error': 'Server unreachable'}
+        except ldap.NO_SUCH_OBJECT:
+            return {'success': False, 'error': 'Base DN does not exist'}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+
+class OIDCAuthenticator:
+    """OAuth2/OIDC authentication handler
+
+    Supports generic OIDC providers (Keycloak, Authentik, Okta, etc.)
+    Uses authorization code flow with PKCE for security.
+
+    Config schema:
+    {
+        'issuer': 'https://idp.example.com/realms/myrealm',
+        'client_id': 'pegaprox',
+        'client_secret': '...',
+        'scopes': ['openid', 'profile', 'email', 'groups'],
+        'claims': {
+            'username': 'preferred_username',
+            'email': 'email',
+            'display_name': 'name',
+            'groups': 'groups'
+        },
+        'verify_ssl': True
+    }
+    """
+
+    def __init__(self, config: dict, provider_id: str):
+        self.config = config
+        self.provider_id = provider_id
+        self._well_known = None
+        self._jwks = None
+
+    def _get_well_known(self) -> dict:
+        """Fetch and cache OIDC well-known configuration"""
+        if self._well_known:
+            return self._well_known
+
+        if not OIDC_AVAILABLE:
+            return {}
+
+        try:
+            issuer = self.config.get('issuer', '').rstrip('/')
+            well_known_url = f"{issuer}/.well-known/openid-configuration"
+
+            verify_ssl = self.config.get('verify_ssl', True)
+            response = requests.get(well_known_url, timeout=10, verify=verify_ssl)
+            response.raise_for_status()
+
+            self._well_known = response.json()
+            return self._well_known
+
+        except Exception as e:
+            logging.error(f"Failed to fetch OIDC well-known config: {e}")
+            return {}
+
+    def get_authorization_url(self, redirect_uri: str, state: str = None) -> tuple:
+        """Generate OAuth2 authorization URL with PKCE
+
+        Args:
+            redirect_uri: URL to redirect to after auth
+            state: Optional state parameter for CSRF protection
+
+        Returns:
+            tuple of (authorization_url, state, code_verifier)
+        """
+        if not OIDC_AVAILABLE:
+            return (None, None, None)
+
+        well_known = self._get_well_known()
+        auth_endpoint = well_known.get('authorization_endpoint')
+
+        if not auth_endpoint:
+            logging.error("No authorization_endpoint in OIDC configuration")
+            return (None, None, None)
+
+        # Generate PKCE code verifier and challenge
+        code_verifier = base64.urlsafe_b64encode(os.urandom(32)).decode('utf-8').rstrip('=')
+        code_challenge = create_s256_code_challenge(code_verifier)
+
+        # Generate state if not provided
+        if not state:
+            state = base64.urlsafe_b64encode(os.urandom(16)).decode('utf-8').rstrip('=')
+
+        # Build authorization URL
+        params = {
+            'client_id': self.config.get('client_id'),
+            'redirect_uri': redirect_uri,
+            'response_type': 'code',
+            'scope': ' '.join(self.config.get('scopes', ['openid', 'profile', 'email'])),
+            'state': state,
+            'code_challenge': code_challenge,
+            'code_challenge_method': 'S256'
+        }
+
+        auth_url = f"{auth_endpoint}?{urlencode(params)}"
+        return (auth_url, state, code_verifier)
+
+    def exchange_code(self, code: str, redirect_uri: str, code_verifier: str = None) -> dict:
+        """Exchange authorization code for tokens
+
+        Args:
+            code: Authorization code from callback
+            redirect_uri: Same redirect_uri used in authorization
+            code_verifier: PKCE code verifier
+
+        Returns:
+            dict with access_token, id_token, etc. or error
+        """
+        if not OIDC_AVAILABLE:
+            return {'error': 'OIDC library not installed'}
+
+        well_known = self._get_well_known()
+        token_endpoint = well_known.get('token_endpoint')
+
+        if not token_endpoint:
+            return {'error': 'No token_endpoint in OIDC configuration'}
+
+        try:
+            data = {
+                'grant_type': 'authorization_code',
+                'client_id': self.config.get('client_id'),
+                'client_secret': self.config.get('client_secret'),
+                'code': code,
+                'redirect_uri': redirect_uri
+            }
+
+            if code_verifier:
+                data['code_verifier'] = code_verifier
+
+            verify_ssl = self.config.get('verify_ssl', True)
+            response = requests.post(
+                token_endpoint,
+                data=data,
+                timeout=10,
+                verify=verify_ssl
+            )
+
+            if response.status_code != 200:
+                logging.error(f"Token exchange failed: {response.text}")
+                return {'error': f'Token exchange failed: {response.status_code}'}
+
+            return response.json()
+
+        except Exception as e:
+            logging.error(f"Token exchange error: {e}")
+            return {'error': str(e)}
+
+    def get_user_info(self, access_token: str) -> dict:
+        """Get user information from userinfo endpoint
+
+        Args:
+            access_token: Valid access token
+
+        Returns:
+            dict with user claims (sub, email, name, groups, etc.)
+        """
+        if not OIDC_AVAILABLE:
+            return {}
+
+        well_known = self._get_well_known()
+        userinfo_endpoint = well_known.get('userinfo_endpoint')
+
+        if not userinfo_endpoint:
+            return {}
+
+        try:
+            verify_ssl = self.config.get('verify_ssl', True)
+            response = requests.get(
+                userinfo_endpoint,
+                headers={'Authorization': f'Bearer {access_token}'},
+                timeout=10,
+                verify=verify_ssl
+            )
+
+            if response.status_code != 200:
+                logging.error(f"Userinfo request failed: {response.text}")
+                return {}
+
+            return response.json()
+
+        except Exception as e:
+            logging.error(f"Userinfo error: {e}")
+            return {}
+
+    def validate_id_token(self, id_token: str) -> dict:
+        """Validate and decode ID token
+
+        Note: This does basic validation. For production, consider
+        validating signature with provider's JWKS.
+
+        Args:
+            id_token: JWT ID token
+
+        Returns:
+            Decoded token claims or empty dict on error
+        """
+        if not OIDC_AVAILABLE:
+            return {}
+
+        try:
+            # Decode without verification first to get claims
+            # For production, should verify signature using JWKS
+            claims = jwt.decode(
+                id_token,
+                options={"verify_signature": False}
+            )
+
+            # Basic validation
+            issuer = self.config.get('issuer', '').rstrip('/')
+            if claims.get('iss', '').rstrip('/') != issuer:
+                logging.warning(f"ID token issuer mismatch: {claims.get('iss')} != {issuer}")
+
+            if claims.get('aud') != self.config.get('client_id'):
+                logging.warning(f"ID token audience mismatch")
+
+            return claims
+
+        except Exception as e:
+            logging.error(f"ID token validation error: {e}")
+            return {}
+
+    def test_connection(self) -> dict:
+        """Test OIDC provider configuration
+
+        Returns:
+            dict with 'success' and 'message' or 'error'
+        """
+        if not OIDC_AVAILABLE:
+            return {'success': False, 'error': 'OIDC libraries not installed (pip install authlib httpx PyJWT)'}
+
+        try:
+            well_known = self._get_well_known()
+
+            if not well_known:
+                return {'success': False, 'error': 'Could not fetch well-known configuration'}
+
+            required = ['authorization_endpoint', 'token_endpoint', 'issuer']
+            missing = [k for k in required if k not in well_known]
+
+            if missing:
+                return {'success': False, 'error': f'Missing endpoints: {", ".join(missing)}'}
+
+            return {
+                'success': True,
+                'message': 'OIDC configuration valid',
+                'issuer': well_known.get('issuer'),
+                'endpoints': {
+                    'authorization': well_known.get('authorization_endpoint'),
+                    'token': well_known.get('token_endpoint'),
+                    'userinfo': well_known.get('userinfo_endpoint')
+                }
+            }
+
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+
+def resolve_role_from_groups(provider_id: str, external_groups: list, tenant_id: str = None) -> dict:
+    """Resolve PegaProx role from external group memberships
+
+    Mappings are evaluated in priority order (lowest number first).
+    First matching mapping wins.
+
+    Args:
+        provider_id: Auth provider ID
+        external_groups: List of group names/DNs from external provider
+        tenant_id: Optional tenant ID for tenant-specific mappings
+
+    Returns:
+        dict with 'role', 'tenant_id'
+    """
+    db = get_db()
+    mappings = db.get_group_mappings(provider_id)
+
+    # Mappings are already sorted by priority from database
+    for mapping in mappings:
+        external_group = mapping['external_group']
+
+        # Check if any external group matches this mapping
+        # Support both exact match and CN extraction for AD groups
+        for group in external_groups:
+            if group == external_group:
+                return {
+                    'role': mapping['role'],
+                    'tenant_id': mapping.get('tenant_id', '_default')
+                }
+            # Also try matching just the CN part for AD groups
+            # e.g., "CN=Admins,OU=Groups,DC=example,DC=com" matches "Admins"
+            if group.startswith('CN='):
+                cn = group.split(',')[0][3:]  # Extract CN value
+                if cn == external_group:
+                    return {
+                        'role': mapping['role'],
+                        'tenant_id': mapping.get('tenant_id', '_default')
+                    }
+
+    # No mapping found - use provider default
+    provider = db.get_auth_provider(provider_id)
+    if provider:
+        return {
+            'role': provider.get('default_role', 'viewer'),
+            'tenant_id': tenant_id or '_default'
+        }
+
+    return {'role': 'viewer', 'tenant_id': '_default'}
+
+
+def create_external_user(username: str, provider_id: str, external_id: str,
+                        attributes: dict, groups: list, provider_type: str) -> bool:
+    """Create a new user from external authentication
+
+    Args:
+        username: PegaProx username
+        provider_id: Auth provider ID
+        external_id: External unique ID (LDAP DN or OIDC sub)
+        attributes: User attributes (email, display_name, etc.)
+        groups: List of external groups
+        provider_type: Provider type (oidc, ldap_ad, ldap_openldap)
+
+    Returns:
+        True on success
+    """
+    users_db = load_users()
+
+    if username in users_db:
+        return False  # User already exists
+
+    # Resolve role from groups
+    role_info = resolve_role_from_groups(provider_id, groups)
+
+    # Create user with external auth source
+    users_db[username] = {
+        'password_salt': '',  # No local password
+        'password_hash': '',
+        'role': role_info['role'],
+        'permissions': [],
+        'tenant': role_info.get('tenant_id'),
+        'created_at': datetime.now().isoformat(),
+        'last_login': None,
+        'auth_source': f"{provider_type}:{provider_id}",
+        'enabled': True,
+        'totp_secret_encrypted': '',
+        'totp_pending_secret_encrypted': '',
+        'totp_enabled': False,
+        'force_password_change': False,
+        'theme': '',
+        'language': '',
+        'ui_layout': 'modern'
+    }
+
+    save_users(users_db)
+
+    # Link external identity
+    db = get_db()
+    db.link_external_identity(
+        username=username,
+        provider_id=provider_id,
+        external_id=external_id,
+        external_username=attributes.get('username'),
+        external_email=attributes.get('email'),
+        external_groups=groups
+    )
+
+    log_audit('system', 'user.auto_created',
+              f"Auto-created user {username} from {provider_type} provider {provider_id}")
+
+    return True
+
+
+def sync_user_from_external(username: str, provider_id: str, auth_result: dict):
+    """Update user from external provider on login
+
+    Syncs group memberships and updates role if group mappings changed.
+
+    Args:
+        username: PegaProx username
+        provider_id: Auth provider ID
+        auth_result: Authentication result with groups, attributes
+    """
+    db = get_db()
+    groups = auth_result.get('groups', [])
+    external_id = auth_result.get('external_id') or auth_result.get('user_dn')
+
+    # Update external identity groups
+    if external_id:
+        db.update_external_identity_groups(provider_id, external_id, groups)
+
+    # Check if role should be updated based on new group memberships
+    server_settings = load_server_settings()
+    if server_settings.get('external_auth_sync_groups_on_login', True):
+        role_info = resolve_role_from_groups(provider_id, groups)
+
+        users_db = load_users()
+        if username in users_db:
+            current_role = users_db[username].get('role')
+            new_role = role_info['role']
+
+            if current_role != new_role:
+                users_db[username]['role'] = new_role
+                save_users(users_db)
+                log_audit(username, 'user.role_synced',
+                          f"Role updated from {current_role} to {new_role} based on external groups")
+
+
+def authenticate_with_ldap(provider_id: str, username: str, password: str) -> dict:
+    """Authenticate user against LDAP provider
+
+    Args:
+        provider_id: Auth provider ID
+        username: Username
+        password: Password
+
+    Returns:
+        Authentication result dict
+    """
+    db = get_db()
+    provider = db.get_auth_provider(provider_id)
+
+    if not provider or not provider.get('enabled'):
+        return {'success': False, 'error': 'Provider not found or disabled'}
+
+    provider_type = provider.get('type', AUTH_PROVIDER_LDAP_AD)
+    config = provider.get('config', {})
+
+    authenticator = LDAPAuthenticator(config, provider_type)
+    return authenticator.authenticate(username, password)
+
+
+def get_enabled_ldap_providers() -> list:
+    """Get list of enabled LDAP providers
+
+    Returns:
+        List of provider dicts
+    """
+    db = get_db()
+    all_providers = db.get_auth_providers(enabled_only=True)
+    return [p for p in all_providers if p['type'] in (AUTH_PROVIDER_LDAP_AD, AUTH_PROVIDER_LDAP_OPENLDAP)]
+
+
+def get_enabled_oidc_providers() -> list:
+    """Get list of enabled OIDC providers
+
+    Returns:
+        List of provider dicts
+    """
+    db = get_db()
+    all_providers = db.get_auth_providers(enabled_only=True)
+    return [p for p in all_providers if p['type'] == AUTH_PROVIDER_OIDC]
+
+
 # =====================================================
 # UPDATE CHECKER
 # Checks GitHub for new versions and allows auto-update
@@ -20084,6 +21532,361 @@ def serve_favicon():
 def serve_images(filename):
     """Serve image files (pegaprox logo, sponsor logos, etc.)"""
     return send_from_directory(IMAGES_DIR, filename)
+
+
+# ============================================
+# EXTERNAL AUTHENTICATION PROVIDER MANAGEMENT
+# NS: Feb 2026 - LDAP and OAuth2/OIDC provider configuration
+# ============================================
+
+@app.route('/api/auth/providers/public', methods=['GET'])
+def get_public_auth_providers():
+    """Get list of enabled auth providers for login page (public endpoint)
+
+    Returns only provider ID, name, and type - no sensitive config.
+    """
+    try:
+        db = get_db()
+        providers = db.get_auth_providers(enabled_only=True)
+
+        # Return only public info
+        public_providers = [{
+            'id': p['id'],
+            'name': p['name'],
+            'type': p['type']
+        } for p in providers]
+
+        return jsonify({
+            'providers': public_providers,
+            'local_enabled': True  # TODO: make configurable
+        })
+    except Exception as e:
+        logging.error(f"Error getting public providers: {e}")
+        return jsonify({'providers': [], 'local_enabled': True})
+
+
+@app.route('/api/auth/providers', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def get_auth_providers():
+    """Get all auth providers (admin only)
+
+    Returns full provider info with masked secrets.
+    """
+    try:
+        db = get_db()
+        providers = db.get_auth_providers()
+
+        # Mask sensitive fields
+        for p in providers:
+            config = p.get('config', {})
+            if 'client_secret' in config:
+                config['client_secret'] = '********' if config['client_secret'] else ''
+            if 'bind_password' in config:
+                config['bind_password'] = '********' if config['bind_password'] else ''
+            p['config'] = config
+
+        return jsonify({'providers': providers})
+
+    except Exception as e:
+        logging.error(f"Error getting auth providers: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def get_auth_provider(provider_id):
+    """Get single auth provider by ID (admin only)"""
+    try:
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        # Mask sensitive fields
+        config = provider.get('config', {})
+        if 'client_secret' in config:
+            config['client_secret'] = '********' if config['client_secret'] else ''
+        if 'bind_password' in config:
+            config['bind_password'] = '********' if config['bind_password'] else ''
+        provider['config'] = config
+
+        return jsonify(provider)
+
+    except Exception as e:
+        logging.error(f"Error getting auth provider: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_auth_provider():
+    """Create new auth provider (admin only)"""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        # Validate required fields
+        if not data.get('name'):
+            return jsonify({'error': 'Provider name is required'}), 400
+
+        if not data.get('type') or data['type'] not in (AUTH_PROVIDER_OIDC, AUTH_PROVIDER_LDAP_AD, AUTH_PROVIDER_LDAP_OPENLDAP):
+            return jsonify({'error': 'Invalid provider type'}), 400
+
+        # Generate provider ID
+        provider_id = data.get('id') or str(uuid.uuid4())[:8]
+
+        # Build provider object
+        provider = {
+            'id': provider_id,
+            'name': data['name'],
+            'type': data['type'],
+            'enabled': data.get('enabled', True),
+            'priority': data.get('priority', 100),
+            'default_role': data.get('default_role', 'viewer'),
+            'auto_create_users': data.get('auto_create_users', False),
+            'config': data.get('config', {})
+        }
+
+        db = get_db()
+        db.save_auth_provider(provider)
+
+        log_audit(session.get('user', 'admin'), 'auth_provider.created',
+                  f"Created auth provider: {data['name']} ({data['type']})")
+
+        return jsonify({'success': True, 'id': provider_id})
+
+    except Exception as e:
+        logging.error(f"Error creating auth provider: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>', methods=['PUT'])
+@require_auth(roles=[ROLE_ADMIN])
+def update_auth_provider(provider_id):
+    """Update existing auth provider (admin only)"""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        db = get_db()
+        existing = db.get_auth_provider(provider_id)
+
+        if not existing:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        # Preserve existing secrets if masked values sent
+        config = data.get('config', existing.get('config', {}))
+        existing_config = existing.get('config', {})
+
+        if config.get('client_secret') == '********':
+            config['client_secret'] = existing_config.get('client_secret', '')
+        if config.get('bind_password') == '********':
+            config['bind_password'] = existing_config.get('bind_password', '')
+
+        # Build updated provider
+        provider = {
+            'id': provider_id,
+            'name': data.get('name', existing['name']),
+            'type': data.get('type', existing['type']),
+            'enabled': data.get('enabled', existing['enabled']),
+            'priority': data.get('priority', existing['priority']),
+            'default_role': data.get('default_role', existing['default_role']),
+            'auto_create_users': data.get('auto_create_users', existing['auto_create_users']),
+            'config': config
+        }
+
+        db.save_auth_provider(provider)
+
+        log_audit(session.get('user', 'admin'), 'auth_provider.updated',
+                  f"Updated auth provider: {provider['name']}")
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        logging.error(f"Error updating auth provider: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_auth_provider(provider_id):
+    """Delete auth provider (admin only)"""
+    try:
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        db.delete_auth_provider(provider_id)
+
+        log_audit(session.get('user', 'admin'), 'auth_provider.deleted',
+                  f"Deleted auth provider: {provider['name']}")
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        logging.error(f"Error deleting auth provider: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>/test', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def test_auth_provider(provider_id):
+    """Test auth provider connection (admin only)"""
+    try:
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        provider_type = provider.get('type')
+        config = provider.get('config', {})
+
+        if provider_type == AUTH_PROVIDER_OIDC:
+            authenticator = OIDCAuthenticator(config, provider_id)
+        elif provider_type in (AUTH_PROVIDER_LDAP_AD, AUTH_PROVIDER_LDAP_OPENLDAP):
+            authenticator = LDAPAuthenticator(config, provider_type)
+        else:
+            return jsonify({'error': 'Unknown provider type'}), 400
+
+        result = authenticator.test_connection()
+
+        return jsonify(result)
+
+    except Exception as e:
+        logging.error(f"Error testing auth provider: {e}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+# Group Mapping Endpoints
+
+@app.route('/api/auth/providers/<provider_id>/mappings', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def get_group_mappings(provider_id):
+    """Get group-to-role mappings for a provider (admin only)"""
+    try:
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        mappings = db.get_group_mappings(provider_id)
+
+        return jsonify({'mappings': mappings})
+
+    except Exception as e:
+        logging.error(f"Error getting group mappings: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>/mappings', methods=['POST'])
+@require_auth(roles=[ROLE_ADMIN])
+def create_group_mapping(provider_id):
+    """Add group-to-role mapping (admin only)"""
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'No data provided'}), 400
+
+        if not data.get('external_group'):
+            return jsonify({'error': 'External group is required'}), 400
+
+        if not data.get('role'):
+            return jsonify({'error': 'Role is required'}), 400
+
+        db = get_db()
+        provider = db.get_auth_provider(provider_id)
+
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        mapping = {
+            'provider_id': provider_id,
+            'external_group': data['external_group'],
+            'role': data['role'],
+            'tenant_id': data.get('tenant_id', '_default'),
+            'priority': data.get('priority', 100)
+        }
+
+        mapping_id = db.save_group_mapping(mapping)
+
+        log_audit(session.get('user', 'admin'), 'group_mapping.created',
+                  f"Created group mapping: {data['external_group']} -> {data['role']}")
+
+        return jsonify({'success': True, 'id': mapping_id})
+
+    except Exception as e:
+        logging.error(f"Error creating group mapping: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/auth/providers/<provider_id>/mappings/<int:mapping_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def delete_group_mapping(provider_id, mapping_id):
+    """Delete group-to-role mapping (admin only)"""
+    try:
+        db = get_db()
+        success = db.delete_group_mapping(mapping_id)
+
+        if not success:
+            return jsonify({'error': 'Mapping not found'}), 404
+
+        log_audit(session.get('user', 'admin'), 'group_mapping.deleted',
+                  f"Deleted group mapping ID: {mapping_id}")
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        logging.error(f"Error deleting group mapping: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+# User External Identity Endpoints
+
+@app.route('/api/users/<username>/identities', methods=['GET'])
+@require_auth(roles=[ROLE_ADMIN])
+def get_user_identities(username):
+    """Get external identities linked to a user (admin only)"""
+    try:
+        db = get_db()
+        identities = db.get_user_external_identities(username)
+
+        return jsonify({'identities': identities})
+
+    except Exception as e:
+        logging.error(f"Error getting user identities: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/users/<username>/identities/<int:identity_id>', methods=['DELETE'])
+@require_auth(roles=[ROLE_ADMIN])
+def unlink_user_identity(username, identity_id):
+    """Unlink external identity from user (admin only)"""
+    try:
+        db = get_db()
+        success = db.unlink_external_identity(identity_id)
+
+        if not success:
+            return jsonify({'error': 'Identity not found'}), 404
+
+        log_audit(session.get('user', 'admin'), 'external_identity.unlinked',
+                  f"Unlinked external identity {identity_id} from user {username}")
+
+        return jsonify({'success': True})
+
+    except Exception as e:
+        logging.error(f"Error unlinking identity: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/settings/server', methods=['GET'])
 @require_auth(roles=[ROLE_ADMIN])

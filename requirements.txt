@@ -26,3 +26,9 @@ gevent-websocket>=0.10.0
 # === Two-Factor Auth ===
 pyotp>=2.9.0
 qrcode[pil]>=7.4.0
+
+# === External Authentication (LDAP/OAuth2) ===
+python-ldap>=3.4.0
+authlib>=1.3.0
+httpx>=0.27.0
+PyJWT>=2.8.0
