@@ -187,6 +187,7 @@ except ImportError:
 LDAP_AVAILABLE = False
 try:
     import ldap
+    import ldap.filter
     LDAP_AVAILABLE = True
 except ImportError:
     pass  # Optional - LDAP auth won't be available
