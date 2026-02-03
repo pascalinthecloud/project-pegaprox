@@ -1148,7 +1148,38 @@
                 lastLogin: 'Letzte Anmeldung',
                 never: 'Nie',
                 profile: 'Profil',
-                
+
+                // External Authentication
+                authentication: 'Authentifizierung',
+                authProviders: 'Authentifizierungsanbieter',
+                authProvidersDesc: 'LDAP und OAuth2/OIDC Anbieter für externe Authentifizierung konfigurieren',
+                addProvider: 'Anbieter hinzufügen',
+                editProvider: 'Anbieter bearbeiten',
+                providerName: 'Anbietername',
+                providerType: 'Anbietertyp',
+                providerEnabled: 'Aktiviert',
+                autoCreateUsers: 'Benutzer automatisch erstellen',
+                defaultRole: 'Standardrolle',
+                testConnection: 'Verbindung testen',
+                connectionSuccess: 'Verbindung erfolgreich',
+                connectionFailed: 'Verbindung fehlgeschlagen',
+                groupMappings: 'Gruppenzuordnungen',
+                externalGroup: 'Externe Gruppe',
+                noMappings: 'Keine Gruppenzuordnungen konfiguriert',
+                mappingCreated: 'Gruppenzuordnung erstellt',
+                mappingDeleted: 'Gruppenzuordnung gelöscht',
+                ldapServer: 'LDAP Server',
+                ldapBindDn: 'Bind DN',
+                ldapBindPassword: 'Bind Passwort',
+                ldapBaseDn: 'Basis DN',
+                ldapUserSearchBase: 'Benutzer-Suchbasis',
+                ldapUserSearchFilter: 'Benutzer-Suchfilter',
+                oidcIssuer: 'Issuer URL',
+                oidcClientId: 'Client ID',
+                oidcClientSecret: 'Client Secret',
+                noProvidersConfigured: 'Keine Authentifizierungsanbieter konfiguriert',
+                addProviderHint: 'LDAP oder OIDC Anbieter für externe Authentifizierung hinzufügen',
+
                 // PegaProx Settings
                 pegaproxSettings: 'PegaProx Einstellungen',
                 serverSettings: 'Server',
@@ -3330,7 +3361,38 @@
                 lastLogin: 'Last Login',
                 never: 'Never',
                 profile: 'Profile',
-                
+
+                // External Authentication
+                authentication: 'Authentication',
+                authProviders: 'Authentication Providers',
+                authProvidersDesc: 'Configure LDAP and OAuth2/OIDC providers for external authentication',
+                addProvider: 'Add Provider',
+                editProvider: 'Edit Provider',
+                providerName: 'Provider Name',
+                providerType: 'Provider Type',
+                providerEnabled: 'Enabled',
+                autoCreateUsers: 'Auto-create users',
+                defaultRole: 'Default Role',
+                testConnection: 'Test Connection',
+                connectionSuccess: 'Connection successful',
+                connectionFailed: 'Connection failed',
+                groupMappings: 'Group Mappings',
+                externalGroup: 'External Group',
+                noMappings: 'No group mappings configured',
+                mappingCreated: 'Group mapping created',
+                mappingDeleted: 'Group mapping deleted',
+                ldapServer: 'LDAP Server',
+                ldapBindDn: 'Bind DN',
+                ldapBindPassword: 'Bind Password',
+                ldapBaseDn: 'Base DN',
+                ldapUserSearchBase: 'User Search Base',
+                ldapUserSearchFilter: 'User Search Filter',
+                oidcIssuer: 'Issuer URL',
+                oidcClientId: 'Client ID',
+                oidcClientSecret: 'Client Secret',
+                noProvidersConfigured: 'No authentication providers configured',
+                addProviderHint: 'Add LDAP or OIDC providers for external authentication',
+
                 // PegaProx Settings
                 pegaproxSettings: 'PegaProx Settings',
                 serverSettings: 'Server',
@@ -10582,7 +10644,7 @@
                         </div>
                     ) : providers.length === 0 ? (
                         <div className="text-center py-12 bg-proxmox-dark border border-proxmox-border rounded-xl">
-                            <Icons.Key className="w-12 h-12 mx-auto text-gray-500 mb-3" />
+                            <Icons.Key className="w-12 h-12 mx-auto block text-gray-500 mb-3" />
                             <p className="text-gray-400">{t('noProvidersConfigured') || 'No authentication providers configured'}</p>
                             <p className="text-sm text-gray-500 mt-1">{t('addProviderHint') || 'Add LDAP or OIDC providers for external authentication'}</p>
                         </div>
