@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.4-blue" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-0.6.5-blue" alt="Version"/>
   <img src="https://img.shields.io/badge/python-3.8+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/license-AGPL--3.0--License-orange" alt="License"/>
 </p>
@@ -49,6 +49,7 @@ PegaProx is a powerful web-based management interface for Proxmox VE clusters. M
 
 ### Security & Access Control
 - 👥 **Multi-User Support** - Role-based access control (Admin, Operator, Viewer)
+- 🛠️ **API Token Management** - Create, list, and revoke Bearer tokens for scripts, CI/CD & monitoring
 - 🔐 **2FA Authentication** - TOTP-based two-factor authentication
 - 🛡️ **VM-Level ACLs** - Fine-grained permissions per VM
 - 🏢 **Multi-Tenancy** - Isolate clusters for different customers
